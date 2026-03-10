@@ -1,0 +1,52 @@
+dag:
+  name: "recommend-pipeline"
+  max_concurrency: 8
+  timeout: 5s
+
+  nodes:
+    - name: "recall_cf"
+      timeout: 200ms
+      retry:
+        count: 2
+        interval: 50ms
+        strategy: "fixed"
+      critical: true
+      priority: 10
+      depends_on: []
+
+    - name: "recall_content"
+      timeout: 200ms
+      retry:
+        count: 1
+        interval: 50ms
+        strategy: "fixed"
+      critical: false
+      priority: 5
+      depends_on: []
+
+    - name: "recall_hot"
+      timeout: 150ms
+      critical: false
+      priority: 3
+      depends_on: []
+
+    - name: "merge_and_rank"
+      timeout: 500ms
+      critical: true
+      priority: 10
+      depends_on:
+        - "recall_cf"
+        - "recall_content"
+        - "recall_hot"
+
+    - name: "filter"
+      timeout: 200ms
+      critical: true
+      depends_on:
+        - "merge_and_rank"
+
+    - name: "fill_detail"
+      timeout: 300ms
+      critical: false
+      depends_on:
+        - "filter"
