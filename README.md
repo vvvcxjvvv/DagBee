@@ -24,10 +24,8 @@ A lightweight, production-ready DAG (Directed Acyclic Graph) execution framework
 ## Installation
 
 ```bash
-go get dagbee
+go get github.com/vvvcxjvvv/DagBee@latest
 ```
-
-> Replace `dagbee` with your actual module path (e.g. `github.com/your-org/dagbee`) after publishing.
 
 ## Quick Start
 
@@ -39,7 +37,7 @@ import (
     "fmt"
     "time"
 
-    "dagbee"
+	"github.com/vvvcxjvvv/DagBee"
 )
 
 func main() {
