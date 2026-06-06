@@ -143,6 +143,23 @@ go test -v -race ./...          # unit + integration tests
 go test -bench=. -benchmem ./...  # benchmarks
 ```
 
+## Pressure Benchmarks
+
+```bash
+go test -run '^$' -bench 'BenchmarkEngineRun_(WideDAG|DeepDAG|FanOutFanIn|RetryAmplification|ParallelRequests)$' -benchmem ./...
+go test -run '^$' -bench 'BenchmarkSharedStore_HotKeyContention$' -benchmem ./...
+go test -run '^$' -bench 'BenchmarkEngineRun_ParallelRequests$' -benchmem -cpuprofile cpu.out -memprofile mem.out ./...
+```
+
+Scenarios included:
+
+- `BenchmarkEngineRun_WideDAG`: wide DAG scheduling overhead and burst parallelism
+- `BenchmarkEngineRun_DeepDAG`: long dependency-chain scheduling overhead
+- `BenchmarkEngineRun_FanOutFanIn`: fan-out/fan-in merge pressure
+- `BenchmarkEngineRun_RetryAmplification`: retry-driven load amplification
+- `BenchmarkEngineRun_ParallelRequests`: many concurrent requests, each running one DAG
+- `BenchmarkSharedStore_HotKeyContention`: `SharedStore` hot-key lock contention
+
 ## Project Structure
 
 ```
