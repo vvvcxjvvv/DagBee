@@ -4,6 +4,7 @@ dag:
   timeout: 5s
 
   nodes:
+    # ── Phase 1: 多路召回 (parallel) ──
     - name: "recall_cf"
       timeout: 200ms
       retry:
@@ -14,39 +15,79 @@ dag:
       priority: 10
       depends_on: []
 
-    - name: "recall_content"
+    - name: "recall_vec"
       timeout: 200ms
       retry:
         count: 1
         interval: 50ms
         strategy: "fixed"
-      critical: false
-      priority: 5
+      critical: true
+      priority: 8
       depends_on: []
 
     - name: "recall_hot"
       timeout: 150ms
       critical: false
-      priority: 3
+      priority: 5
       depends_on: []
 
-    - name: "merge_and_rank"
-      timeout: 500ms
+    # ── Phase 2: 合并去重 ──
+    - name: "merge"
+      timeout: 100ms
       critical: true
-      priority: 10
       depends_on:
         - "recall_cf"
-        - "recall_content"
+        - "recall_vec"
         - "recall_hot"
 
-    - name: "filter"
+    # ── Phase 3: 补全特征详情 (精排模型输入) ──
+    - name: "fill_detail"
       timeout: 200ms
       critical: true
       depends_on:
-        - "merge_and_rank"
+        - "merge"
 
-    - name: "fill_detail"
+    # ── Phase 4: 过滤 (黑名单 / 已曝光 / 库存) ──
+    - name: "filter"
+      timeout: 100ms
+      critical: true
+      depends_on:
+        - "fill_detail"
+
+    # ── Phase 5: 精排多模型预估 (parallel) ──
+    - name: "score_ctr"
       timeout: 300ms
-      critical: false
+      retry:
+        count: 1
+        interval: 100ms
+        strategy: "exponential"
+      critical: true
+      priority: 8
       depends_on:
         - "filter"
+
+    - name: "score_cvr"
+      timeout: 400ms
+      retry:
+        count: 1
+        interval: 100ms
+        strategy: "exponential"
+      critical: false
+      priority: 6
+      depends_on:
+        - "filter"
+
+    # ── Phase 6: 多目标融合排序 (eCPM) ──
+    - name: "fuse_rank"
+      timeout: 200ms
+      critical: true
+      depends_on:
+        - "score_ctr"
+        - "score_cvr"
+
+    # ── Phase 7: 重排 (多样性 + 业务规则) ──
+    - name: "rerank"
+      timeout: 150ms
+      critical: true
+      depends_on:
+        - "fuse_rank"

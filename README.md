@@ -82,22 +82,60 @@ dag:
   max_concurrency: 8
   timeout: 5s
   nodes:
+    # Multi-channel recall (parallel)
     - name: "recall_cf"
       timeout: 200ms
       retry: { count: 2, interval: 50ms, strategy: "fixed" }
       critical: true
       priority: 10
       depends_on: []
-    - name: "merge_and_rank"
-      timeout: 500ms
+    - name: "recall_vec"
+      timeout: 200ms
       critical: true
-      depends_on: ["recall_cf"]
+      depends_on: []
+    - name: "recall_hot"
+      timeout: 150ms
+      critical: false
+      depends_on: []
+    # Merge + dedup
+    - name: "merge"
+      depends_on: ["recall_cf", "recall_vec", "recall_hot"]
+    # Fill item features for ranking models
+    - name: "fill_detail"
+      depends_on: ["merge"]
+    # Filter (blacklist / exposed / stock)
+    - name: "filter"
+      depends_on: ["fill_detail"]
+    # Multi-model estimation (parallel)
+    - name: "score_ctr"
+      timeout: 300ms
+      retry: { count: 1, interval: 100ms, strategy: "exponential" }
+      critical: true
+      depends_on: ["filter"]
+    - name: "score_cvr"
+      timeout: 400ms
+      critical: false
+      depends_on: ["filter"]
+    # Multi-objective fusion (eCPM)
+    - name: "fuse_rank"
+      depends_on: ["score_ctr", "score_cvr"]
+    # Rerank (diversity + business rules)
+    - name: "rerank"
+      depends_on: ["fuse_rank"]
 ```
 
 ```go
 registry := map[string]dagbee.NodeFunc{
-    "recall_cf":      myRecallCF,
-    "merge_and_rank": myMergeAndRank,
+    "recall_cf":   myRecallCF,
+    "recall_vec":  myRecallVec,
+    "recall_hot":  myRecallHot,
+    "merge":       myMerge,
+    "fill_detail": myFillDetail,
+    "filter":      myFilter,
+    "score_ctr":   myScoreCTR,
+    "score_cvr":   myScoreCVR,
+    "fuse_rank":   myFuseRank,
+    "rerank":      myRerank,
 }
 d, err := dagbee.LoadDAGFromYAML("examples/recommend/pipeline.yaml", registry)
 ```
@@ -195,8 +233,10 @@ dagbee/
 │── Examples & Docs ──────────────────────────────────
 ├── examples/
 │   ├── simple/         Minimal 3-node example
-│   └── recommend/      Full recommendation pipeline with YAML config
-│       ├── main.go
+│   ├── mapreduce/      Word-count MapReduce pipeline (split→map→shuffle→reduce→merge)
+│   └── recommend/      Recommendation pipeline with YAML config
+│       ├── main.go     Multi-channel recall → merge → fill_detail → filter
+│       │               → CTR/CVR scoring → eCPM fusion → rerank
 │       └── pipeline.yaml
 ├── docs/
 │   ├── design-prompt.md
