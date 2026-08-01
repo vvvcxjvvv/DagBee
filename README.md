@@ -1,34 +1,44 @@
 <p align="center">
-  <img src="asset/dagbee-logo.png" alt="DagBee logo" width="220">
+  <img src="asset/dagbee-logo.png" alt="DagBee logo" width="128">
+</p>
+
+<h1 align="center">DagBee</h1>
+
+<p align="center">
+  Lightweight in-memory DAG orchestration for Go.
+  Bounded concurrency, resilient execution, runtime routing, and dynamic subflows.
 </p>
 
 <p align="center">
- DagBee: Lightweight In-Memory DAG Orchestration for Go | Nested Subflow · Priority Schedule · Deadlock Safe · No External Dependencies
+  <img src="https://img.shields.io/badge/Go-1.19%2B-00ADD8?logo=go&logoColor=white" alt="Go 1.19+">
+  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
 </p>
+
+<p align="center">
+  <a href="#features">Features</a> |
+  <a href="#quick-start">Quick Start</a> |
+  <a href="#examples">Examples</a> |
+  <a href="#observability">Observability</a> |
+  <a href="#documentation">Documentation</a>
+</p>
+
+DagBee executes dependency graphs inside a Go process. Independent nodes run
+concurrently, dependent nodes run after their prerequisites, and one shared
+worker pool bounds concurrency across the root DAG and all nested subflows.
 
 ## Features
 
-- **Parallel + serial mixed execution** — nodes with no dependency run concurrently; dependent nodes run in order
-- **Concurrency control** — configurable max parallelism via worker pool
-- **Priority scheduling** — ready nodes are dispatched by priority (higher = first)
-- **Per-node timeout & retry** — independent timeout, retry count, and backoff strategy (fixed / exponential) per node
-- **Failure strategies** — critical nodes abort the DAG; non-critical nodes degrade gracefully
-- **Fallback functions** — provide default data when a node fails
-- **Panic recovery** — a panicking node never crashes the process
-- **Graceful shutdown** — context cancellation stops scheduling and waits for running nodes
-- **DAGContext** — concurrency-safe sharded key-value store for passing data between nodes, with generics support
-- **Lifecycle hooks** — BeforeNode / AfterNode / OnNodeSkip / OnDAGComplete
-- **Logger interface** — plug in zap, logrus, or any structured logger
-- **YAML configuration** — declare topology and node settings in YAML; register functions in Go
-- **Conditional execution** — skip nodes based on runtime predicates
-- **Route branching** — multi-branch routing via RouteFn + RouteMap; one index can activate multiple downstream nodes simultaneously
-- **Subflow** — dynamically generate and execute child DAGs at runtime with shared DAGContext, shared worker pool, and async dispatch (no worker blocking)
-- **Visualization** — text-based topological layer output for debugging
-- **DOT export** — static topology plus execution-aware Graphviz output with status, condition results, selected routes, and expanded Subflows
-- **Chrome Trace** — Perfetto-compatible JSON timeline with full event tracing (start/end/retry/skip/fail), route args, subflow nesting
-- **Flame graph** — standard folded-stack `parent;child duration_us` output for slow-node identification
-- **Object pooling** — `sync.Pool` reuse of DagResult / NodeResult to reduce GC pressure
-- **Near-zero framework overhead** — ~7μs to build a 20-node DAG, ~1.3μs scheduling per node, ~360B memory per node
+| Area | Capabilities |
+| --- | --- |
+| Scheduling | Parallel and serial execution, bounded worker pool, priority scheduling |
+| Resilience | DAG and node timeouts, fixed or exponential retries, fallback functions, panic recovery, graceful cancellation |
+| Failure control | Critical nodes abort the DAG; non-critical nodes degrade without stopping independent work |
+| Runtime flow | Predicate-based node conditions, indexed one-to-many route branches, dynamically generated nested subflows |
+| Data sharing | Concurrent sharded `DAGContext` with typed access helpers |
+| Configuration | Go functional options and declarative YAML topology |
+| Extensibility | Lifecycle hooks and pluggable structured logging |
+| Observability | Text topology, static and execution-aware DOT, Chrome Trace, and folded flame graph export |
+| Allocation control | Pooled DAG and node results to reduce repeated allocations |
 
 ## Installation
 
@@ -36,304 +46,326 @@
 go get github.com/vvvcxjvvv/DagBee@latest
 ```
 
+DagBee requires Go 1.19 or later.
+
 ## Quick Start
 
 ```go
 package main
 
 import (
-    "context"
-    "fmt"
-    "time"
+	"context"
+	"fmt"
+	"log"
 
-	"github.com/vvvcxjvvv/DagBee"
+	dagbee "github.com/vvvcxjvvv/DagBee"
 )
 
 func main() {
-    d := dagbee.NewDAG("example",
-        dagbee.WithMaxConcurrency(4),
-        dagbee.WithTimeout(5*time.Second),
-    )
+	d := dagbee.NewDAG("hello", dagbee.WithMaxConcurrency(4))
 
-    d.AddNode("A", func(ctx context.Context, dctx *dagbee.DAGContext) error {
-        dctx.Set("greeting", "hello")
-        return nil
-    }, dagbee.NodeWithPriority(10))
+	must(d.AddNode("load-user", func(_ context.Context, dctx *dagbee.DAGContext) error {
+		dctx.Set("user", "Ada")
+		return nil
+	}))
 
-    d.AddNode("B", func(ctx context.Context, dctx *dagbee.DAGContext) error {
-        dctx.Set("name", "world")
-        return nil
-    }, dagbee.NodeWithPriority(5))
+	must(d.AddNode("load-message", func(_ context.Context, dctx *dagbee.DAGContext) error {
+		dctx.Set("message", "hello")
+		return nil
+	}))
 
-    d.AddNode("C", func(ctx context.Context, dctx *dagbee.DAGContext) error {
-        g, _ := dagbee.GetTyped[string](dctx, "greeting")
-        n, _ := dagbee.GetTyped[string](dctx, "name")
-        fmt.Printf("%s, %s!\n", g, n)
-        return nil
-    },
-        dagbee.NodeWithDependsOn("A", "B"),
-        dagbee.NodeWithTimeout(200*time.Millisecond),
-    )
+	must(d.AddNode("render", func(_ context.Context, dctx *dagbee.DAGContext) error {
+		user, _ := dagbee.GetTyped[string](dctx, "user")
+		message, _ := dagbee.GetTyped[string](dctx, "message")
+		fmt.Printf("%s, %s\n", message, user)
+		return nil
+	}, dagbee.NodeWithDependsOn("load-user", "load-message")))
 
-    result := dagbee.NewEngine().Run(context.Background(), d)
-    fmt.Println("Status:", result.Status) // Success
+	result := dagbee.NewEngine().Run(context.Background(), d)
+	defer dagbee.ReleaseDagResult(result)
+
+	if result.Status != dagbee.StatusSuccess {
+		log.Fatal(result.Error)
+	}
+}
+
+func must(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
+`load-user` and `load-message` can run in parallel. `render` starts after both
+finish. Consume or export the result before calling `ReleaseDagResult`.
+
+## Core API
+
+### Node Options
+
+| Option | Description |
+| --- | --- |
+| `NodeWithDependsOn(names...)` | Declare upstream dependencies |
+| `NodeWithPriority(priority)` | Set ready-queue priority; higher values run first |
+| `NodeWithTimeout(timeout)` | Set the per-attempt execution timeout |
+| `NodeWithRetry(count, interval)` | Set retry count and base interval |
+| `NodeWithRetryStrategy(strategy)` | Use `RetryFixed` or `RetryExponential` |
+| `NodeWithCritical(critical)` | Abort the DAG on failure when `true` |
+| `NodeWithFallback(fn)` | Run a fallback after all attempts fail |
+| `NodeWithCondition(fn)` | Skip this node when the predicate returns `false` |
+| `NodeWithRoute(fn, routeMap)` | Select one route index; each index may activate multiple downstream nodes |
+| `NodeWithSubflow(fn)` | Generate and execute a child DAG at runtime |
+
+### DAG Options
+
+| Option | Description |
+| --- | --- |
+| `WithMaxConcurrency(n)` | Set the maximum number of active workers; defaults to `runtime.NumCPU()` |
+| `WithTimeout(timeout)` | Set the overall DAG timeout |
+| `WithHook(hook)` | Register a lifecycle hook |
+| `WithLogger(logger)` | Set the DAG logger |
+
+### Engine Options
+
+| Option | Description |
+| --- | --- |
+| `EngineWithLogger(logger)` | Set the engine logger |
+| `EngineWithDAGContextShards(n)` | Set context lock partitions; defaults to `runtime.NumCPU()*4`, rounded to a power of two |
+| `EngineWithMaxSubflowDepth(n)` | Set the maximum subflow nesting depth; defaults to `10` |
+
+## Runtime Flow
+
+### Conditions and Routes
+
+Conditions gate the node on which they are configured. Routes run their node,
+then select downstream branches by index. A route index can activate multiple
+branches.
+
+```go
+must(d.AddNode("select-plan", selectPlan,
+	dagbee.NodeWithRoute(
+		func(dctx *dagbee.DAGContext) int {
+			premium, _ := dagbee.GetTyped[bool](dctx, "premium")
+			if premium {
+				return 0
+			}
+			return 1
+		},
+		map[int][]string{
+			0: {"premium-rank", "premium-offers"},
+			1: {"standard-rank"},
+		},
+	),
+))
+```
+
+Every routed downstream node must also declare the route node through
+`NodeWithDependsOn`. `NodeWithCondition` and `NodeWithRoute` are mutually
+exclusive on the same node.
+
+### Dynamic Subflows
+
+A subflow builds its child DAG at runtime. Parent and child DAGs share the same
+`DAGContext` and worker pool, so the concurrency limit applies to the full
+execution tree.
+
+```go
+must(d.AddNode("recall", nil,
+	dagbee.NodeWithDependsOn("prepare"),
+	dagbee.NodeWithSubflow(func(
+		_ context.Context,
+		dctx *dagbee.DAGContext,
+	) (*dagbee.DAG, error) {
+		partitions, _ := dagbee.GetTyped[int](dctx, "partitions")
+		sub := dagbee.NewDAG("recall-partitions")
+
+		for i := 0; i < partitions; i++ {
+			name := fmt.Sprintf("partition-%d", i)
+			must(sub.AddNode(name, recallPartition(i)))
+		}
+		return sub, nil
+	}),
+))
+```
+
+See [the complete subflow example](examples/subflow/main.go) and
+[the subflow design](docs/subflow-design.md).
+
 ## YAML Configuration
 
-Define the topology in YAML, register the Go functions separately:
+YAML defines topology and node settings. Executable functions remain registered
+in Go.
 
 ```yaml
-# examples/recommend/pipeline.yaml
 dag:
-  name: "recommend-pipeline"
+  name: recommendation
   max_concurrency: 8
   timeout: 5s
   nodes:
-    # Multi-channel recall (parallel)
-    - name: "recall_cf"
+    - name: recall
       timeout: 200ms
-      retry: { count: 2, interval: 50ms, strategy: "fixed" }
-      critical: true
+      retry: {count: 2, interval: 50ms, strategy: fixed}
       priority: 10
-      depends_on: []
-    - name: "recall_vec"
-      timeout: 200ms
       critical: true
-      depends_on: []
-    - name: "recall_hot"
-      timeout: 150ms
-      critical: false
-      depends_on: []
-    # Merge + dedup
-    - name: "merge"
-      depends_on: ["recall_cf", "recall_vec", "recall_hot"]
-    # Fill item features for ranking models
-    - name: "fill_detail"
-      depends_on: ["merge"]
-    # Filter (blacklist / exposed / stock)
-    - name: "filter"
-      depends_on: ["fill_detail"]
-    # Multi-model estimation (parallel)
-    - name: "score_ctr"
-      timeout: 300ms
-      retry: { count: 1, interval: 100ms, strategy: "exponential" }
-      critical: true
-      depends_on: ["filter"]
-    - name: "score_cvr"
-      timeout: 400ms
-      critical: false
-      depends_on: ["filter"]
-    # Multi-objective fusion (eCPM)
-    - name: "fuse_rank"
-      depends_on: ["score_ctr", "score_cvr"]
-    # Rerank (diversity + business rules)
-    - name: "rerank"
-      depends_on: ["fuse_rank"]
+    - name: rank
+      depends_on: [recall]
 ```
 
 ```go
 registry := map[string]dagbee.NodeFunc{
-    "recall_cf":   myRecallCF,
-    "recall_vec":  myRecallVec,
-    "recall_hot":  myRecallHot,
-    "merge":       myMerge,
-    "fill_detail": myFillDetail,
-    "filter":      myFilter,
-    "score_ctr":   myScoreCTR,
-    "score_cvr":   myScoreCVR,
-    "fuse_rank":   myFuseRank,
-    "rerank":      myRerank,
+	"recall": recall,
+	"rank":   rank,
 }
-d, err := dagbee.LoadDAGFromYAML("examples/recommend/pipeline.yaml", registry)
+
+d, err := dagbee.LoadDAGFromYAML("pipeline.yaml", registry)
 ```
 
-## Node Options
+See the [recommendation pipeline](examples/recommend/pipeline.yaml) for a full
+configuration. Runtime-generated subflows are configured in Go through
+`NodeWithSubflow`.
 
-| Option | Description |
-|--------|-------------|
-| `NodeWithTimeout(d)` | Per-attempt execution timeout |
-| `NodeWithRetry(count, interval)` | Retry count and base interval |
-| `NodeWithRetryStrategy(s)` | `RetryFixed` or `RetryExponential` |
-| `NodeWithCritical(bool)` | `true` = abort DAG on failure; `false` = degrade |
-| `NodeWithPriority(int)` | Scheduling priority (higher = first) |
-| `NodeWithFallback(fn)` | Fallback function when all retries fail |
-| `NodeWithDependsOn(names...)` | Upstream dependency declarations |
-| `NodeWithCondition(fn)` | Predicate gate — skip when false |
-| `NodeWithRoute(fn, map)` | Route node — select downstream branch group by index (one-to-many supported) |
-| `NodeWithSubflow(fn)` | Dynamic child DAG generation (subflow node) |
-## DAG Options
+## Observability
 
-| Option | Description |
-|--------|-------------|
-| `WithMaxConcurrency(n)` | Max parallel workers (default: NumCPU) |
-| `WithTimeout(d)` | Overall DAG execution timeout |
-| `WithHook(h)` | Register a lifecycle hook |
-| `WithLogger(l)` | Inject a custom Logger |
+DagBee provides four topology and execution views:
 
-## Engine Options
+| Export | API | Purpose |
+| --- | --- | --- |
+| Text layers | `DAG.Visualize()` | Quick terminal inspection |
+| Static Graphviz | `DAG.ExportDOT()` | Topology before execution |
+| Execution Graphviz | `DagResult.ExportDOT()` | Status, condition results, selected routes, and expanded runtime subflows |
+| Chrome Trace | `DagResult.ExportChromeTrace()` | Perfetto timeline and per-node timing |
+| Flame graph data | `DagResult.ExportFlamegraph()` | Folded stacks for slow-path analysis |
 
-| Option | Description |
-|--------|-------------|
-| `EngineWithLogger(l)` | Inject a custom Logger into the engine |
-| `EngineWithDAGContextShards(n)` | DAGContext shard count (default: NumCPU*4) |
-| `EngineWithMaxSubflowDepth(n)` | Max subflow nesting depth (default: 10) |
-## Observability Exports
-
-Run the complete example to export all three formats:
+Run the observability example:
 
 ```bash
 go run ./examples/observability
 ```
 
-Generated files:
+It writes all output under `examples/observability/`.
 
-- `examples/observability/dag.dot` — execution-aware topology; render with `dot -Tsvg examples/observability/dag.dot -o examples/observability/dag.svg`
-- `examples/observability/trace.json` — open in [Perfetto](https://ui.perfetto.dev/) or `chrome://tracing`
-- `examples/observability/flamegraph.folded` — folded stack data for generating a flame graph
-
-The example covers critical, conditional, route, skipped-branch, and nested Subflow nodes. The generated DOT expands the runtime-created child DAG and highlights the selected execution path.
-
-Render and view the flame graph:
+### Graphviz
 
 ```bash
-# Install the FlameGraph renderer once.
+dot -Tsvg examples/observability/dag.dot \
+  -o examples/observability/dag.svg
+
+# macOS
+open examples/observability/dag.svg
+
+# Linux
+xdg-open examples/observability/dag.svg
+```
+
+The execution-aware graph includes condition outcomes, selected and skipped
+route edges, node status and duration, and nested subflow clusters.
+
+<p align="center">
+  <img src="examples/observability/dag.svg" alt="DagBee execution-aware Graphviz output" width="760">
+</p>
+
+### Chrome Trace
+
+Open [Perfetto](https://ui.perfetto.dev/), choose **Open trace file**, and select
+`examples/observability/trace.json`. Chrome-based browsers can also use
+`chrome://tracing`.
+
+### Flame Graph
+
+```bash
 git clone --depth 1 https://github.com/brendangregg/FlameGraph.git /tmp/FlameGraph
 
-# Convert folded stack data to SVG.
 /tmp/FlameGraph/flamegraph.pl \
   --title "DagBee Execution Flame Graph" \
   --countname "microseconds" \
   examples/observability/flamegraph.folded \
   > examples/observability/flamegraph.svg
 
-# Open the generated SVG on macOS.
+# macOS
 open examples/observability/flamegraph.svg
 
-# Linux alternative:
-# xdg-open examples/observability/flamegraph.svg
+# Linux
+xdg-open examples/observability/flamegraph.svg
 ```
 
-The wider the frame, the more total execution time it represents. Nested frames show Subflow call paths; hover a frame to inspect its exact duration and click it to zoom.
+Wider frames represent more total execution time. Nested frames represent
+subflow paths; hover for duration and click to zoom.
+
+Export execution data before releasing its pooled result:
 
 ```go
-// 1. Static DOT topology, available before execution.
-staticDOT := d.ExportDOT()
-
-result := eng.Run(ctx, d)
+result := engine.Run(ctx, d)
 defer dagbee.ReleaseDagResult(result)
 
-// 2. Execution-aware DOT topology. Export before releasing result.
-// Includes status, condition result, selected route, and Subflow children.
 executionDOT := result.ExportDOT()
-
-// 3. Chrome Trace timeline (post-execution, timing analysis)
-trace, _ := result.ExportChromeTrace()
-os.WriteFile("trace.json", []byte(trace), 0644)
-// Open chrome://tracing or perfetto.dev
-
-// 4. Flame graph (post-execution, slow-node identification)
-fg := result.ExportFlamegraph()
-// flamegraph.pl flame.folded > flame.svg
+traceJSON, err := result.ExportChromeTrace()
+flamegraphData := result.ExportFlamegraph()
 ```
 
 ## Architecture
 
-```
-User Layer       Core Layer            Engine Layer            Data Layer
-┌──────────┐    ┌──────────────┐      ┌───────────────┐      ┌─────────────┐
-│ Go API   │───►│ DAG          │─────►│ Engine        │─────►│ DAGContext │
-│ YAML Cfg │    │ Node         │      │ Scheduler     │      │ DagResult   │
-└──────────┘    │ Validator    │      │ WorkerPool    │      │ Hooks       │
-                └──────────────┘      └───────────────┘      │ Logger      │
-                                                             └─────────────┘
+```mermaid
+flowchart LR
+    Input["Go API / YAML"] --> Model["DAG / Node / Validator"]
+    Model --> Runtime["Engine / Scheduler / Shared Worker Pool"]
+    Runtime --> Context["Sharded DAGContext"]
+    Runtime --> Results["DagResult"]
+    Runtime --> Support["Hooks / Logger / Observability"]
 ```
 
-## Running Tests
+The engine validates the graph, schedules ready nodes by priority, and runs them
+through a fixed-size worker pool. Dynamic subflows reuse that pool instead of
+creating a separate concurrency domain.
+
+## Examples
+
+| Example | Description | Run |
+| --- | --- | --- |
+| [Simple](examples/simple/main.go) | Parallel inputs followed by a dependent merge | `go run ./examples/simple` |
+| [MapReduce](examples/mapreduce/main.go) | Split, map, shuffle, reduce, and merge | `go run ./examples/mapreduce` |
+| [Subflow](examples/subflow/main.go) | Runtime-generated child DAG | `go run ./examples/subflow` |
+| [Observability](examples/observability/main.go) | DOT, Chrome Trace, and flame graph exports | `go run ./examples/observability` |
+| [Recommendation](examples/recommend/main.go) | YAML-driven recommendation pipeline | `go run ./examples/recommend` |
+
+## Development
+
+Run tests and the race detector:
 
 ```bash
-go test -v -race ./...          # unit + integration tests
-go test -bench=. -benchmem ./...  # benchmarks
+go test ./...
+go test -race ./...
 ```
 
-## Pressure Benchmarks
+Run benchmarks:
 
 ```bash
-go test -run '^$' -bench 'BenchmarkEngineRun_(WideDAG|DeepDAG|FanOutFanIn|RetryAmplification|ParallelRequests)$' -benchmem ./...
-go test -run '^$' -bench 'BenchmarkDAGContext_(HotKeyContention|DistinctKeyContention)$' -benchmem ./...
-go test -run '^$' -bench 'BenchmarkEngineRun_ParallelRequests$' -benchmem -cpuprofile cpu.out -memprofile mem.out ./...
+go test -run '^$' -bench . -benchmem ./...
 ```
 
-Scenarios included:
+Focused pressure benchmarks cover wide and deep DAGs, fan-out/fan-in,
+retry amplification, concurrent requests, and hot-key versus distinct-key
+`DAGContext` contention.
 
-- `BenchmarkEngineRun_WideDAG`: wide DAG scheduling overhead and burst parallelism
-- `BenchmarkEngineRun_DeepDAG`: long dependency-chain scheduling overhead
-- `BenchmarkEngineRun_FanOutFanIn`: fan-out/fan-in merge pressure
-- `BenchmarkEngineRun_RetryAmplification`: retry-driven load amplification
-- `BenchmarkEngineRun_ParallelRequests`: many concurrent requests, each running one DAG
-- `BenchmarkDAGContext_HotKeyContention`: `DAGContext` hot-key lock contention
-- `BenchmarkDAGContext_DistinctKeyContention`: `DAGContext` distinct-key fan-out write parallelism (sharded lock validation)
+```bash
+go test -run '^$' \
+  -bench 'BenchmarkEngineRun_(WideDAG|DeepDAG|FanOutFanIn|RetryAmplification|ParallelRequests)$' \
+  -benchmem ./...
 
-## Project Structure
-
+go test -run '^$' \
+  -bench 'BenchmarkDAGContext_(HotKeyContention|DistinctKeyContention)$' \
+  -benchmem ./...
 ```
-dagbee/
-│
-│── Core ─────────────────────────────────────────────
-├── dag.go              DAG definition, node registration, cycle detection
-├── node.go             Node type, NodeFunc signature, NodeOption
-│
-│── Engine ───────────────────────────────────────────
-├── engine.go           Execution engine: executeDAG event loop, async subflow, route branching, retry/fallback
-├── scheduler.go        Priority-based ready-queue (container/heap)
-├── workerpool.go       Fixed-size worker pool (shared, nil-skip for async subflow)
-│
-│── Data ─────────────────────────────────────────────
-├── dagcontext.go            DAGContext: sharded key-value store with per-shard RWMutex
-├── result.go           NodeResult / DagResult + sync.Pool
-│
-│── Support ──────────────────────────────────────────
-├── config.go           YAML configuration parser
-├── options.go          Functional options (DAGOption, EngineOption)
-├── hook.go             Hook interface + HookChain
-├── errors.go           Sentinel errors + PanicError
-├── logger.go           Logger interface + StdLogger
-├── visualize.go        Text-based DAG topology visualization
-├── dot.go              DOT/Graphviz topology export
-├── execution_dot.go    Execution-aware DOT with runtime Subflow expansion
-├── trace.go            Chrome Trace JSON + flame graph text export
-├── doc.go              Package documentation & file organization guide
-│
-│── Tests ────────────────────────────────────────────
-├── dag_test.go         DAG construction, cycle detection tests
-├── engine_test.go      Engine scheduling, concurrency, fault tolerance tests
-├── dagcontext_test.go       DAGContext concurrency safety tests
-├── benchmark_test.go   Performance benchmarks
-├── observability_test.go DOT/Trace/Flamegraph export tests
-│
-│── Examples & Docs ──────────────────────────────────
-├── examples/
-│   ├── simple/         Minimal 3-node example
-│   ├── mapreduce/      Word-count MapReduce pipeline (split→map→shuffle→reduce→merge)
-│   ├── subflow/        Dynamic subflow: runtime child DAG with shared context & worker pool
-│   ├── observability/  Export DOT, Chrome Trace, and flame graph files
-│   └── recommend/      Recommendation pipeline with YAML config
-│       ├── main.go     Multi-channel recall → merge → fill_detail → filter
-│       │               → CTR/CVR scoring → eCPM fusion → rerank
-│       └── pipeline.yaml
-├── docs/
-│   ├── design-prompt.md
-│   ├── issuesAndStrategy.md
-│   ├── subflow-design.md
-│   ├── subflow-async-optimization.md
-│   ├── route-condition-design.md
-│   └── dag-frameworks-research.md
-│
-├── go.mod
-├── go.sum
-└── README.md
-```
+
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [Issues and strategies](docs/issuesAndStrategy.md) | Identified bottlenecks, alternatives, decisions, and implementations |
+| [Subflow design](docs/subflow-design.md) | Runtime child DAG semantics and work-sharing model |
+| [Async subflow optimization](docs/subflow-async-optimization.md) | Shared worker pool and non-blocking subflow execution |
+| [Route condition design](docs/route-condition-design.md) | Condition gates and indexed route branches |
+| [DAG framework research](docs/dag-frameworks-research.md) | Comparison with related DAG frameworks |
+| [Design prompt](docs/design-prompt.md) | Original project requirements and design context |
 
 ## License
 
