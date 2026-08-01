@@ -308,6 +308,131 @@ WideDAG 1024 节点的 allocs 降幅最大（63%），因为消除了 1024 次 g
 
 ---
 
+## #3 Subflow 嵌套子图支持
+
+### 当前问题
+
+DAG 是静态构建的：`AddNode` 注册所有节点和边，`Validate` 做环检测，`Engine.Run` 拿到完整 DAG 后一次性调度。运行期间无法向 scheduler 动态添加节点。
+
+用户可在 NodeFunc 内手动 `NewEngine().Run(ctx, subDAG)` 嵌入子 DAG，但存在五个问题：
+
+1. **DAGContext 不共享** — 子 DAG 创建自己的 DAGContext，父数据需手动传递。
+2. **Worker pool 不共享** — 子 DAG 独立 worker pool，并发度不协调，可能 goroutine 爆炸。
+3. **结果不可见** — 子 DAG 的 NodeResult 藏在父节点结果里，父 DagResult 无法看到子节点执行细节。
+4. **Hooks 断裂** — 子 DAG 用自己的 HookChain，父 hooks 无法观测子节点生命周期。
+5. **超时/取消可传递** — ctx 透传，唯一做对的部分。
+
+### 策略抉择
+
+#### 方案 A：手动嵌入（保持现状）
+
+用户在 NodeFunc 内手动 `NewEngine().Run(ctx, subDAG)`。
+
+| 优点 | 缺点 |
+|------|------|
+| 零框架改动 | DAGContext 不共享，手动传数据繁琐 |
+| 覆盖简单封装场景 | Worker pool 独立，并发度不协调 |
+| | 结果不可见，调试困难 |
+| | Hooks 断裂 |
+
+#### 方案 B：RunSubflow 辅助函数
+
+封装手动步骤，共享 dctx、串联 hooks、封装数据传递。
+
+| 优点 | 缺点 |
+|------|------|
+| 改动小，仅新增辅助函数 | Worker pool 仍独立 |
+| DAGContext 共享 | 子结果仍不在父 DagResult 中 |
+| Hooks 串联 | |
+
+#### 方案 C：原生 SubflowNode + 共享 worker pool + work-stealing
+
+新增 `SubflowFunc` 节点类型，递归调用 `executeDAG`，共享 dctx 和 worker pool。Event loop 使用 work-stealing 避免死锁。
+
+| 优点 | 缺点 |
+|------|------|
+| 子结果完全可见，调试友好 | Engine 核心改动大 |
+| 共享 worker pool 和 DAGContext | 嵌套深度控制需配置 |
+| Hooks 天然继承 | |
+| Work-stealing 避免死锁 | |
+
+#### 方案 D：运行时动态节点注入
+
+允许节点执行时向当前 DAG 注入新节点。
+
+| 优点 | 缺点 |
+|------|------|
+| 最灵活，真正"运行时构图" | 破坏 DAG 静态性，环检测无法预验证 |
+| 适合递归任务 | 调度器核心改动极大 |
+| | 终止条件不确定，可能无限递归 |
+
+#### 抉择
+
+选择 **方案 C**。
+
+方案 A 已能工作但体验差。方案 B 是方案 C 的子集，收益有限。方案 D 破坏 DAG 静态性，风险过高。方案 C 提供原生 subflow 支持，通过共享 worker pool + work-stealing 解决并发度和死锁问题。
+
+### 落地实现
+
+**文件**: `engine.go`、`node.go`、`result.go`、`dag.go`、`options.go`、`workerpool.go`
+
+核心设计：
+
+```go
+// SubflowFunc 动态生成子 DAG
+type SubflowFunc func(ctx context.Context, dctx *DAGContext) (*DAG, error)
+
+// Node 新增 SubflowFn 字段
+type Node struct {
+    // ...现有字段...
+    SubflowFn SubflowFunc
+}
+
+// NodeResult 新增 SubflowResult 字段
+type NodeResult struct {
+    // ...现有字段...
+    SubflowResult *DagResult
+}
+```
+
+**关键机制**：
+
+1. **executeDAG 可重入** — 从 `Run` 中提取，接收共享的 `dctx`、`wp`、`parentHooks`、`depth` 参数。子 DAG 递归调用，共享同一 worker pool。
+
+2. **Worker pool 共享 + unbuffered readyCh** — 整个执行树共享一个 worker pool。`readyCh` 为无缓冲 channel，event loop 通过 `select { case readyCh <- task: ... }` 阻塞式分派，确保任务不会被卡在 buffer 中。
+
+3. **Work-stealing 避免死锁** — depth > 0 时，event loop 的 `select` 增加 `case task := <-stealCh`（`stealCh = wp.readyCh`）。当所有 worker 阻塞在 subflow event loop 中时，等待 `doneCh` 的 event loop 主动消费 `readyCh` 执行任意层任务。depth = 0 时 `stealCh = nil`，不窃取（Run goroutine 不是 worker）。
+
+4. **execTask 结构** — worker pool 的 `readyCh` 类型从 `chan *Node` 改为 `chan *execTask`，每个 task 携带自己的 `doneCh` 和 `exec` 函数，支持 per-DAG 结果路由。
+
+5. **结果嵌套 + 递归释放** — `NodeResult.SubflowResult` 挂载子 DAG 结果。`releaseDagResultRecursive` 递归释放所有嵌套层级。
+
+6. **深度限制** — `EngineWithMaxSubflowDepth(n)`，默认 10 层。
+
+**死锁场景验证**（`TestSubflow_DeadlockAvoidance`）：
+
+`maxConcurrency=2`，两个 subflow 节点并发执行。无 work-stealing 时两个 worker 都阻塞在 subflow event loop，子节点永远排队 → 死锁。有 work-stealing 时，每个 event loop 在等 `doneCh` 的同时消费 `readyCh`，交替执行对方子图的节点 → 全部完成。
+
+**测试覆盖**：
+
+| 测试 | 验证内容 |
+|------|---------|
+| `TestSubflow_Basic` | 基本 subflow 执行和结果访问 |
+| `TestSubflow_Nested` | 多层嵌套（3 层）结果递归访问 |
+| `TestSubflow_MaxDepth` | 深度限制生效 |
+| `TestSubflow_PanicRecovery` | SubflowFn panic 被 recover 捕获 |
+| `TestSubflow_PanicInConstruction` | 非关键节点 panic 不影响 DAG |
+| `TestSubflow_DAGContextShared` | 父子共享 dctx 读写 |
+| `TestSubflow_DeadlockAvoidance` | maxConcurrency=2 双 subflow 不死锁 |
+| `TestSubflow_EmptyDAG` | 返回 nil DAG 视为成功 |
+| `TestSubflow_ConstructionError` | 构建错误正确标记 |
+| `TestSubflow_ConcurrencyRespected` | 并发度受控 |
+
+54 个测试全部通过，30 次连续运行零失败。
+
+
+---
+
 <!--
 模板（复制后填充）:
 

@@ -17,7 +17,7 @@ A lightweight, production-ready DAG (Directed Acyclic Graph) execution framework
 - **Logger interface** — plug in zap, logrus, or any structured logger
 - **YAML configuration** — declare topology and node settings in YAML; register functions in Go
 - **Conditional execution** — skip nodes based on runtime predicates
-- **Visualization** — text-based topological layer output for debugging
+- **Subflow** — dynamically generate and execute child DAGs at runtime with shared DAGContext, shared worker pool, and work-stealing deadlock prevention- **Visualization** — text-based topological layer output for debugging
 - **Object pooling** — `sync.Pool` reuse of DagResult / NodeResult to reduce GC pressure
 - **Near-zero framework overhead** — ~7μs to build a 20-node DAG, ~1.3μs scheduling per node, ~360B memory per node
 
@@ -152,7 +152,7 @@ d, err := dagbee.LoadDAGFromYAML("examples/recommend/pipeline.yaml", registry)
 | `NodeWithFallback(fn)` | Fallback function when all retries fail |
 | `NodeWithDependsOn(names...)` | Upstream dependency declarations |
 | `NodeWithCondition(fn)` | Predicate gate — skip when false |
-
+| `NodeWithSubflow(fn)` | Dynamic child DAG generation (subflow node) |
 ## DAG Options
 
 | Option | Description |
@@ -162,6 +162,13 @@ d, err := dagbee.LoadDAGFromYAML("examples/recommend/pipeline.yaml", registry)
 | `WithHook(h)` | Register a lifecycle hook |
 | `WithLogger(l)` | Inject a custom Logger |
 
+## Engine Options
+
+| Option | Description |
+|--------|-------------|
+| `EngineWithLogger(l)` | Inject a custom Logger into the engine |
+| `EngineWithDAGContextShards(n)` | DAGContext shard count (default: NumCPU*4) |
+| `EngineWithMaxSubflowDepth(n)` | Max subflow nesting depth (default: 10) |
 ## Architecture
 
 ```

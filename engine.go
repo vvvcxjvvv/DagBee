@@ -8,16 +8,23 @@ import (
 	"time"
 )
 
+// defaultMaxSubflowDepth is the default maximum nesting depth for subflows.
+const defaultMaxSubflowDepth = 10
+
 // Engine orchestrates the execution of a DAG: validation, topological
 // scheduling, concurrency control, retry/fallback, and result collection.
 type Engine struct {
-	dctxShards int
-	logger     Logger
+	dctxShards      int
+	maxSubflowDepth int
+	logger          Logger
 }
 
 // NewEngine creates an Engine with the given options.
 func NewEngine(opts ...EngineOption) *Engine {
-	e := &Engine{logger: noopLogger{}}
+	e := &Engine{
+		logger:          noopLogger{},
+		maxSubflowDepth: defaultMaxSubflowDepth,
+	}
 	for _, opt := range opts {
 		opt(e)
 	}
@@ -40,13 +47,7 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 		return result
 	}
 
-	// --- Context with optional DAG-level timeout ---
-	dagCtx, dagCancel := context.WithCancel(ctx)
-	if d.timeout > 0 {
-		dagCtx, dagCancel = context.WithTimeout(ctx, d.timeout)
-	}
-	defer dagCancel()
-
+	// --- DAGContext ---
 	var dctx *DAGContext
 	n := e.dctxShards
 	if n > 0 {
@@ -60,6 +61,65 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 		logger = e.logger
 	}
 
+	// --- Shared worker pool (per-Run, entire execution tree) ---
+	maxConc := d.maxConcurrency
+	if maxConc <= 0 {
+		maxConc = runtime.NumCPU()
+	}
+	wp := newWorkerPool(maxConc)
+	wp.start()
+
+	result = e.executeDAG(ctx, d, dctx, wp, nil, 0, logger)
+
+	wp.stop()
+	wp.wait()
+
+	// --- Finalize ---
+	d.hooks.OnDAGComplete(ctx, result)
+	logger.Info("DAG completed",
+		"dag", d.name,
+		"status", result.Status,
+		"duration", result.Duration,
+		"success", result.SuccessCount(),
+		"failed", result.FailedCount(),
+		"skipped", result.SkippedCount(),
+	)
+
+	return result
+}
+
+// executeDAG runs a single DAG layer within the execution tree. It is
+// reentrant: subflow nodes call it recursively with a child DAG, sharing
+// the same dctx and worker pool. The event loop uses work-stealing to
+// avoid deadlock when workers are blocked in nested subflow event loops.
+func (e *Engine) executeDAG(
+	ctx context.Context,
+	d *DAG,
+	dctx *DAGContext,
+	wp *workerPool,
+	parentHooks *HookChain,
+	depth int,
+	logger Logger,
+) *DagResult {
+	result := AcquireDagResult()
+	result.DagName = d.name
+	result.StartTime = time.Now()
+
+	// --- Context with optional DAG-level timeout ---
+	// context.WithTimeout automatically takes min(parent timeout, child timeout).
+	dagCtx, dagCancel := context.WithCancel(ctx)
+	if d.timeout > 0 {
+		dagCtx, dagCancel = context.WithTimeout(ctx, d.timeout)
+	}
+	defer dagCancel()
+
+	// --- Merge parent hooks ---
+	if parentHooks != nil {
+		for _, h := range parentHooks.hooks {
+			d.hooks.Add(h)
+		}
+	}
+
 	total := len(d.nodes)
 
 	// --- Pending dependency counts (atomic int32 per node) ---
@@ -67,15 +127,6 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 	for name := range d.nodes {
 		count := int32(len(d.reverseEdges[name]))
 		pending[name] = &count
-	}
-
-	// --- Concurrency control ---
-	maxConc := d.maxConcurrency
-	if maxConc <= 0 {
-		maxConc = runtime.NumCPU()
-	}
-	if maxConc > total {
-		maxConc = total
 	}
 
 	doneCh := make(chan *NodeResult, total)
@@ -90,36 +141,65 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 		}
 	}
 
-	// --- Worker pool ---
-	// A fixed set of worker goroutines replaces per-node go func() calls.
-	// Workers block on wp.readyCh; the main loop dispatches nodes as workers
-	// become idle, so concurrency is naturally bounded by worker count.
-	wp := newWorkerPool(maxConc, func(node *Node) *NodeResult {
-		return e.executeNode(dagCtx, node, dctx, d, logger)
-	}, doneCh)
-	wp.start()
-
-	// launchReady dispatches as many ready nodes as there are idle workers.
-	// Called from the main event loop goroutine only — no concurrent access
-	// to `started` or `scheduler`.
-	launchReady := func() {
-		for scheduler.Len() > 0 {
-			select {
-			case wp.readyCh <- scheduler.Peek():
-				node := scheduler.Dequeue()
-				started[node.Name] = true
-			default:
-				return // all workers busy — will retry after next completion
-			}
+	// dispatchReady sends the next ready node to a worker via wp.readyCh.
+	// Called from the event loop's select alongside doneCh.
+	dispatchReady := func() *execTask {
+		if scheduler.Len() == 0 {
+			return nil
+		}
+		return &execTask{
+			node:   scheduler.Peek(),
+			doneCh: doneCh,
+			exec: func(node *Node) *NodeResult {
+				return e.executeNode(dagCtx, node, dctx, d, wp, depth, logger)
+			},
 		}
 	}
 
-	launchReady()
+	// commitDispatch removes the peeked node from the scheduler and marks
+	// it as started. Called after a successful readyCh send.
+	commitDispatch := func() {
+		node := scheduler.Dequeue()
+		started[node.Name] = true
+	}
+
+	// Initial dispatch of zero-in-degree nodes.
+	nextTask := dispatchReady()
 
 	// --- Main event loop ---
+	// The event loop selects on:
+	//   - doneCh: process completed node results
+	//   - wp.readyCh send: dispatch a ready node to an idle worker
+	//   - stealCh (depth > 0 only): steal and execute a task from another layer
+	//   - dagCtx.Done(): timeout/cancellation
+	//
+	// The readyCh send case handles both initial dispatch and post-completion
+	// dispatch. It is nil when there are no ready nodes, disabling the case.
+	//
+	// At depth > 0, stealCh = wp.readyCh (enabling work-stealing to prevent
+	// deadlock when all workers are blocked in subflow event loops).
+	// At depth 0, stealCh = nil (the Run goroutine is not a worker).
+	var stealCh chan *execTask
+	if depth > 0 {
+		stealCh = wp.readyCh
+	}
+
+	var readySendCh chan *execTask
+	if nextTask != nil {
+		readySendCh = wp.readyCh
+	}
+
 	completed := 0
 	for completed < total {
 		select {
+		case readySendCh <- nextTask:
+			commitDispatch()
+			nextTask = dispatchReady()
+			readySendCh = wp.readyCh
+			if nextTask == nil {
+				readySendCh = nil
+			}
+
 		case nr := <-doneCh:
 			completed++
 			result.Results[nr.NodeName] = nr
@@ -132,7 +212,6 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 					result.Error = fmt.Errorf("critical node %q failed: %w", nr.NodeName, nr.Error)
 				}
 				dagCancel()
-				// Mark all unstarted nodes as skipped.
 				for name := range d.nodes {
 					if !started[name] && result.Results[name] == nil {
 						started[name] = true
@@ -144,6 +223,8 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 						d.hooks.OnNodeSkip(dagCtx, name, "DAG cancelled due to critical node failure")
 					}
 				}
+				readySendCh = nil
+				nextTask = nil
 				continue
 			}
 
@@ -158,8 +239,20 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 						scheduler.Enqueue(d.nodes[downstream])
 					}
 				}
-				launchReady()
 			}
+			// Prepare next dispatch if not already pending.
+			if nextTask == nil {
+				nextTask = dispatchReady()
+				if nextTask != nil {
+					readySendCh = wp.readyCh
+				}
+			}
+
+		case task := <-stealCh:
+			// Work-stealing (depth > 0 only): execute a ready task from any
+			// DAG layer while waiting for our own doneCh. Prevents deadlock
+			// when all pool workers are blocked in subflow event loops.
+			task.doneCh <- task.exec(task.node)
 
 		case <-dagCtx.Done():
 			if atomic.CompareAndSwapInt32(&dagFailed, 0, 1) && result.Error == nil {
@@ -176,11 +269,10 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 					d.hooks.OnNodeSkip(dagCtx, name, "DAG context done")
 				}
 			}
+			readySendCh = nil
+			nextTask = nil
 		}
 	}
-
-	wp.stop()
-	wp.wait()
 
 	// --- Finalize result ---
 	result.EndTime = time.Now()
@@ -191,26 +283,19 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 		result.Status = StatusSuccess
 	}
 
-	d.hooks.OnDAGComplete(ctx, result)
-	logger.Info("DAG completed",
-		"dag", d.name,
-		"status", result.Status,
-		"duration", result.Duration,
-		"success", result.SuccessCount(),
-		"failed", result.FailedCount(),
-		"skipped", result.SkippedCount(),
-	)
-
 	return result
 }
 
 // executeNode runs a single node with panic recovery, condition checking,
-// retry logic, and fallback handling. Returns a fully populated NodeResult.
+// retry logic, fallback handling, and subflow execution. Returns a fully
+// populated NodeResult.
 func (e *Engine) executeNode(
 	ctx context.Context,
 	n *Node,
 	dctx *DAGContext,
 	d *DAG,
+	wp *workerPool,
+	depth int,
 	logger Logger,
 ) (nr *NodeResult) {
 	nr = acquireNodeResult()
@@ -236,14 +321,51 @@ func (e *Engine) executeNode(
 
 	d.hooks.BeforeNode(ctx, n.Name)
 
-	// Condition gate (P2 feature).
+	// Condition gate.
 	if n.ConditionFn != nil && !n.ConditionFn(dctx) {
 		nr.Status = StatusSkipped
 		d.hooks.OnNodeSkip(ctx, n.Name, "condition not met")
 		return nr
 	}
 
-	// Execute with retries.
+	// --- Subflow branch ---
+	if n.SubflowFn != nil {
+		subDAG, err := n.SubflowFn(ctx, dctx)
+		if err != nil {
+			nr.Status = StatusFailed
+			nr.Error = fmt.Errorf("subflow %q construction failed: %w", n.Name, err)
+			return nr
+		}
+		if subDAG == nil {
+			nr.Status = StatusSuccess // empty subflow
+			return nr
+		}
+		if err := subDAG.Validate(); err != nil {
+			nr.Status = StatusFailed
+			nr.Error = fmt.Errorf("subflow %q validation failed: %w", n.Name, err)
+			return nr
+		}
+		if depth >= e.maxSubflowDepth {
+			nr.Status = StatusFailed
+			nr.Error = fmt.Errorf("subflow %q exceeds max depth %d", n.Name, e.maxSubflowDepth)
+			return nr
+		}
+
+		// Recursively execute child DAG with shared dctx and wp.
+		// The child's event loop uses work-stealing to avoid deadlock.
+		subResult := e.executeDAG(ctx, subDAG, dctx, wp, d.hooks, depth+1, logger)
+		nr.SubflowResult = subResult
+
+		if subResult.Status == StatusFailed {
+			nr.Status = StatusFailed
+			nr.Error = subResult.Error
+		} else {
+			nr.Status = StatusSuccess
+		}
+		return nr
+	}
+
+	// --- Normal node: execute with retries ---
 	retries, err := e.executeWithRetries(ctx, n, dctx, logger)
 	nr.RetryCount = retries
 

@@ -74,6 +74,12 @@ func (s RetryStrategy) String() string {
 //   - a nil return indicates success; a non-nil error triggers retry or fallback logic
 type NodeFunc func(ctx context.Context, dctx *DAGContext) error
 
+// SubflowFunc dynamically generates a child DAG at runtime.
+// ctx carries timeout/cancellation signals; dctx is shared with the parent DAG.
+// Return a nil DAG to skip the subflow (node marked Success).
+// Return an error to fail the node immediately (no retry).
+type SubflowFunc func(ctx context.Context, dctx *DAGContext) (*DAG, error)
+
 // Node represents a single execution unit in the DAG.
 type Node struct {
 	Name          string
@@ -87,6 +93,7 @@ type Node struct {
 	Priority      int  // higher value = higher scheduling priority
 	FallbackFn    NodeFunc
 	ConditionFn   func(*DAGContext) bool // when non-nil, node runs only if this returns true
+	SubflowFn     SubflowFunc            // when non-nil, node is a subflow node; Fn is ignored
 }
 
 // NodeOption configures a Node using the functional options pattern.
@@ -133,4 +140,11 @@ func NodeWithDependsOn(deps ...string) NodeOption {
 // NodeWithCondition sets a predicate; the node is skipped when it returns false.
 func NodeWithCondition(fn func(*DAGContext) bool) NodeOption {
 	return func(n *Node) { n.ConditionFn = fn }
+}
+
+// NodeWithSubflow configures the node as a subflow that dynamically generates
+// a child DAG at runtime. The child DAG shares the parent's DAGContext and
+// worker pool. When set, Fn is ignored.
+func NodeWithSubflow(fn SubflowFunc) NodeOption {
+	return func(n *Node) { n.SubflowFn = fn }
 }

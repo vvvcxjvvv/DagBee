@@ -12,9 +12,9 @@
 //	  node.go         Node type, NodeFunc signature, NodeStatus, NodeOption helpers
 //
 //	Engine ─ Execution and scheduling
-//	  engine.go       Execution engine: validation, scheduling loop, retry/fallback, result collection
+//	  engine.go       Execution engine: executeDAG, event loop with work-stealing, subflow support, retry/fallback
 //	  scheduler.go    Priority-based ready-queue (container/heap), SchedulerStrategy interface
-//	  workerpool.go   Fixed-size worker pool replacing per-node goroutine creation
+//	  workerpool.go   Shared worker pool (unbuffered readyCh, per-DAG doneCh via execTask)
 //
 //	Data ─ Runtime data and results
 //	  dagcontext.go    DAGContext: sharded concurrency-safe key-value store for inter-node data passing

@@ -48,20 +48,24 @@ func (d *DAG) MaxConcurrency() int { return d.maxConcurrency }
 // AddNode registers a node with the given name, function, and options.
 // Dependencies declared via NodeWithDependsOn are recorded as edges.
 func (d *DAG) AddNode(name string, fn NodeFunc, opts ...NodeOption) error {
-	if fn == nil {
-		return fmt.Errorf("%w: %s", ErrNodeFuncNil, name)
-	}
 	if _, exists := d.nodes[name]; exists {
 		return fmt.Errorf("%w: %s", ErrDuplicateNode, name)
 	}
 
 	node := &Node{
 		Name:     name,
-		Fn:       fn,
 		Critical: true, // default to critical
+	}
+	if fn != nil {
+		node.Fn = fn
 	}
 	for _, opt := range opts {
 		opt(node)
+	}
+
+	// Either Fn or SubflowFn must be set.
+	if node.Fn == nil && node.SubflowFn == nil {
+		return fmt.Errorf("%w: %s", ErrNodeFuncNil, name)
 	}
 
 	d.nodes[name] = node

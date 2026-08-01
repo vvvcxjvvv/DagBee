@@ -46,3 +46,15 @@ func EngineWithDAGContextShards(n int) EngineOption {
 		}
 	}
 }
+
+// EngineWithMaxSubflowDepth sets the maximum nesting depth for subflow
+// execution. A value of 0 (the default) allows up to 10 levels. Values
+// less than 1 are ignored, keeping the default. When the depth limit is
+// exceeded, the subflow node fails with an error.
+func EngineWithMaxSubflowDepth(n int) EngineOption {
+	return func(e *Engine) {
+		if n >= 1 {
+			e.maxSubflowDepth = n
+		}
+	}
+}

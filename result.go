@@ -7,13 +7,14 @@ import (
 
 // NodeResult captures the outcome of a single node execution.
 type NodeResult struct {
-	NodeName   string
-	Status     NodeStatus
-	StartTime  time.Time
-	EndTime    time.Time
-	Duration   time.Duration
-	Error      error
-	RetryCount int // number of retries actually performed (0 = first attempt succeeded)
+	NodeName      string
+	Status        NodeStatus
+	StartTime     time.Time
+	EndTime       time.Time
+	Duration      time.Duration
+	Error         error
+	RetryCount    int        // number of retries actually performed (0 = first attempt succeeded)
+	SubflowResult *DagResult // subflow node's child DAG result; nil for normal nodes
 }
 
 // Reset clears all fields, preparing the result for pool reuse.
@@ -25,6 +26,10 @@ func (r *NodeResult) Reset() {
 	r.Duration = 0
 	r.Error = nil
 	r.RetryCount = 0
+	if r.SubflowResult != nil {
+		releaseDagResultRecursive(r.SubflowResult)
+		r.SubflowResult = nil
+	}
 }
 
 // DagResult captures the outcome of an entire DAG execution.
@@ -92,6 +97,21 @@ func (r *DagResult) Reset() {
 		releaseNodeResult(nr)
 		delete(r.Results, k)
 	}
+}
+
+// releaseDagResultRecursive recursively releases a DagResult and all nested
+// SubflowResults back to their respective pools. Handles arbitrary nesting depth.
+func releaseDagResultRecursive(r *DagResult) {
+	for k, nr := range r.Results {
+		if nr.SubflowResult != nil {
+			releaseDagResultRecursive(nr.SubflowResult)
+			nr.SubflowResult = nil
+		}
+		releaseNodeResult(nr)
+		delete(r.Results, k)
+	}
+	// Return the DagResult struct to the pool (its Results map is now empty)
+	dagResultPool.Put(r)
 }
 
 // ---------- sync.Pool for object reuse ----------
