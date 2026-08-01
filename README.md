@@ -356,17 +356,6 @@ go test -run '^$' \
   -benchmem ./...
 ```
 
-## Documentation
-
-| Document | Contents |
-| --- | --- |
-| [Issues and strategies](docs/issuesAndStrategy.md) | Identified bottlenecks, alternatives, decisions, and implementations |
-| [Subflow design](docs/subflow-design.md) | Runtime child DAG semantics and work-sharing model |
-| [Async subflow optimization](docs/subflow-async-optimization.md) | Shared worker pool and non-blocking subflow execution |
-| [Route condition design](docs/route-condition-design.md) | Condition gates and indexed route branches |
-| [DAG framework research](docs/dag-frameworks-research.md) | Comparison with related DAG frameworks |
-| [Design prompt](docs/design-prompt.md) | Original project requirements and design context |
-
 ## License
 
 MIT
