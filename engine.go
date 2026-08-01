@@ -47,7 +47,7 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 	}
 	defer dagCancel()
 
-	store := NewSharedStore()
+	dctx := NewDAGContext()
 
 	logger := d.logger
 	if _, ok := logger.(noopLogger); ok {
@@ -99,7 +99,7 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 				wg.Add(1)
 				go func(n *Node) {
 					defer wg.Done()
-					nr := e.executeNode(dagCtx, n, store, d, logger)
+					nr := e.executeNode(dagCtx, n, dctx, d, logger)
 					<-sem // release semaphore BEFORE sending result
 					doneCh <- nr
 				}(node)
@@ -203,7 +203,7 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 func (e *Engine) executeNode(
 	ctx context.Context,
 	n *Node,
-	store *SharedStore,
+	dctx *DAGContext,
 	d *DAG,
 	logger Logger,
 ) (nr *NodeResult) {
@@ -231,14 +231,14 @@ func (e *Engine) executeNode(
 	d.hooks.BeforeNode(ctx, n.Name)
 
 	// Condition gate (P2 feature).
-	if n.ConditionFn != nil && !n.ConditionFn(store) {
+	if n.ConditionFn != nil && !n.ConditionFn(dctx) {
 		nr.Status = StatusSkipped
 		d.hooks.OnNodeSkip(ctx, n.Name, "condition not met")
 		return nr
 	}
 
 	// Execute with retries.
-	retries, err := e.executeWithRetries(ctx, n, store, logger)
+	retries, err := e.executeWithRetries(ctx, n, dctx, logger)
 	nr.RetryCount = retries
 
 	if err == nil {
@@ -252,7 +252,7 @@ func (e *Engine) executeNode(
 
 	// All attempts exhausted — try fallback.
 	if n.FallbackFn != nil {
-		if fallbackErr := n.FallbackFn(ctx, store); fallbackErr == nil {
+		if fallbackErr := n.FallbackFn(ctx, dctx); fallbackErr == nil {
 			logger.Info("node fallback succeeded", "node", n.Name)
 			nr.Status = StatusSuccess
 			nr.Error = nil
@@ -271,7 +271,7 @@ func (e *Engine) executeNode(
 func (e *Engine) executeWithRetries(
 	ctx context.Context,
 	n *Node,
-	store *SharedStore,
+	dctx *DAGContext,
 	logger Logger,
 ) (retryCount int, err error) {
 	maxAttempts := 1 + n.RetryCount
@@ -291,7 +291,7 @@ func (e *Engine) executeWithRetries(
 				"node", n.Name, "attempt", attempt+1, "max", maxAttempts)
 		}
 
-		err = e.executeAttempt(ctx, n, store)
+		err = e.executeAttempt(ctx, n, dctx)
 		if err == nil {
 			return attempt, nil
 		}
@@ -306,13 +306,13 @@ func (e *Engine) executeWithRetries(
 }
 
 // executeAttempt runs the node function once, wrapping it with a per-attempt timeout.
-func (e *Engine) executeAttempt(ctx context.Context, n *Node, store *SharedStore) error {
+func (e *Engine) executeAttempt(ctx context.Context, n *Node, dctx *DAGContext) error {
 	if n.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, n.Timeout)
 		defer cancel()
 	}
-	return n.Fn(ctx, store)
+	return n.Fn(ctx, dctx)
 }
 
 // retryInterval calculates the wait duration before the given retry attempt.

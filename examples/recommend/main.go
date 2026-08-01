@@ -79,21 +79,21 @@ func main() {
 // Phase 1: Multi-channel recall (parallel)
 // ================================================================
 
-func recallCF(ctx context.Context, store *dagbee.SharedStore) error {
+func recallCF(ctx context.Context, dctx *dagbee.DAGContext) error {
 	time.Sleep(time.Duration(40+rand.Intn(60)) * time.Millisecond)
-	store.Set("recall_cf", itemIDs{"i1", "i2", "i3", "i4", "i5"})
+	dctx.Set("recall_cf", itemIDs{"i1", "i2", "i3", "i4", "i5"})
 	return nil
 }
 
-func recallVec(ctx context.Context, store *dagbee.SharedStore) error {
+func recallVec(ctx context.Context, dctx *dagbee.DAGContext) error {
 	time.Sleep(time.Duration(30+rand.Intn(50)) * time.Millisecond)
-	store.Set("recall_vec", itemIDs{"i3", "i5", "i6", "i7"})
+	dctx.Set("recall_vec", itemIDs{"i3", "i5", "i6", "i7"})
 	return nil
 }
 
-func recallHot(ctx context.Context, store *dagbee.SharedStore) error {
+func recallHot(ctx context.Context, dctx *dagbee.DAGContext) error {
 	time.Sleep(time.Duration(20+rand.Intn(30)) * time.Millisecond)
-	store.Set("recall_hot", itemIDs{"i8", "i1", "i9"})
+	dctx.Set("recall_hot", itemIDs{"i8", "i1", "i9"})
 	return nil
 }
 
@@ -101,11 +101,11 @@ func recallHot(ctx context.Context, store *dagbee.SharedStore) error {
 // Phase 2: Merge + dedup
 // ================================================================
 
-func merge(ctx context.Context, store *dagbee.SharedStore) error {
+func merge(ctx context.Context, dctx *dagbee.DAGContext) error {
 	seen := make(map[string]bool)
 	var merged itemIDs
 	for _, key := range []string{"recall_cf", "recall_vec", "recall_hot"} {
-		if raw, ok := store.Get(key); ok {
+		if raw, ok := dctx.Get(key); ok {
 			for _, id := range raw.(itemIDs) {
 				if !seen[id] {
 					seen[id] = true
@@ -114,7 +114,7 @@ func merge(ctx context.Context, store *dagbee.SharedStore) error {
 			}
 		}
 	}
-	store.Set("merged", merged)
+	dctx.Set("merged", merged)
 	return nil
 }
 
@@ -122,8 +122,8 @@ func merge(ctx context.Context, store *dagbee.SharedStore) error {
 // Phase 3: Fill detail (load item features for ranking models)
 // ================================================================
 
-func fillDetail(ctx context.Context, store *dagbee.SharedStore) error {
-	merged, _ := dagbee.GetTyped[itemIDs](store, "merged")
+func fillDetail(ctx context.Context, dctx *dagbee.DAGContext) error {
+	merged, _ := dagbee.GetTyped[itemIDs](dctx, "merged")
 	categories := []string{"electronics", "books", "fashion", "food", "home"}
 	items := make([]Item, 0, len(merged))
 	for _, id := range merged {
@@ -133,7 +133,7 @@ func fillDetail(ctx context.Context, store *dagbee.SharedStore) error {
 			Category: categories[rand.Intn(len(categories))],
 		})
 	}
-	store.Set("items", items)
+	dctx.Set("items", items)
 	return nil
 }
 
@@ -141,8 +141,8 @@ func fillDetail(ctx context.Context, store *dagbee.SharedStore) error {
 // Phase 4: Filter (blacklist / exposed / stock)
 // ================================================================
 
-func filter(ctx context.Context, store *dagbee.SharedStore) error {
-	items, _ := dagbee.GetTyped[[]Item](store, "items")
+func filter(ctx context.Context, dctx *dagbee.DAGContext) error {
+	items, _ := dagbee.GetTyped[[]Item](dctx, "items")
 	blacklist := map[string]bool{"i9": true}
 	exposed := map[string]bool{"i4": true}
 	var filtered []Item
@@ -152,7 +152,7 @@ func filter(ctx context.Context, store *dagbee.SharedStore) error {
 		}
 		filtered = append(filtered, it)
 	}
-	store.Set("filtered", filtered)
+	dctx.Set("filtered", filtered)
 	return nil
 }
 
@@ -160,23 +160,23 @@ func filter(ctx context.Context, store *dagbee.SharedStore) error {
 // Phase 5: Multi-model estimation (parallel)
 // ================================================================
 
-func scoreCTR(ctx context.Context, store *dagbee.SharedStore) error {
-	items, _ := dagbee.GetTyped[[]Item](store, "filtered")
+func scoreCTR(ctx context.Context, dctx *dagbee.DAGContext) error {
+	items, _ := dagbee.GetTyped[[]Item](dctx, "filtered")
 	scores := make(map[string]float64)
 	for _, it := range items {
 		scores[it.ID] = rand.Float64()
 	}
-	store.Set("scores_ctr", scores)
+	dctx.Set("scores_ctr", scores)
 	return nil
 }
 
-func scoreCVR(ctx context.Context, store *dagbee.SharedStore) error {
-	items, _ := dagbee.GetTyped[[]Item](store, "filtered")
+func scoreCVR(ctx context.Context, dctx *dagbee.DAGContext) error {
+	items, _ := dagbee.GetTyped[[]Item](dctx, "filtered")
 	scores := make(map[string]float64)
 	for _, it := range items {
 		scores[it.ID] = rand.Float64()
 	}
-	store.Set("scores_cvr", scores)
+	dctx.Set("scores_cvr", scores)
 	return nil
 }
 
@@ -184,10 +184,10 @@ func scoreCVR(ctx context.Context, store *dagbee.SharedStore) error {
 // Phase 6: Multi-objective fusion (eCPM)
 // ================================================================
 
-func fuseRank(ctx context.Context, store *dagbee.SharedStore) error {
-	items, _ := dagbee.GetTyped[[]Item](store, "filtered")
-	ctr, _ := dagbee.GetTyped[map[string]float64](store, "scores_ctr")
-	cvr, _ := dagbee.GetTyped[map[string]float64](store, "scores_cvr")
+func fuseRank(ctx context.Context, dctx *dagbee.DAGContext) error {
+	items, _ := dagbee.GetTyped[[]Item](dctx, "filtered")
+	ctr, _ := dagbee.GetTyped[map[string]float64](dctx, "scores_ctr")
+	cvr, _ := dagbee.GetTyped[map[string]float64](dctx, "scores_cvr")
 
 	for i := range items {
 		items[i].CTR = ctr[items[i].ID]
@@ -199,7 +199,7 @@ func fuseRank(ctx context.Context, store *dagbee.SharedStore) error {
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].eCPM > items[j].eCPM
 	})
-	store.Set("ranked", items)
+	dctx.Set("ranked", items)
 	return nil
 }
 
@@ -207,8 +207,8 @@ func fuseRank(ctx context.Context, store *dagbee.SharedStore) error {
 // Phase 7: Rerank (diversity + business rules)
 // ================================================================
 
-func rerank(ctx context.Context, store *dagbee.SharedStore) error {
-	items, _ := dagbee.GetTyped[[]Item](store, "ranked")
+func rerank(ctx context.Context, dctx *dagbee.DAGContext) error {
+	items, _ := dagbee.GetTyped[[]Item](dctx, "ranked")
 	// Exploration decay to avoid filter bubble.
 	for i := range items {
 		items[i].Score = items[i].eCPM * (1.0 - 0.02*float64(i))
@@ -224,6 +224,6 @@ func rerank(ctx context.Context, store *dagbee.SharedStore) error {
 		fmt.Printf("  %-2d   %-6s  %-12s  %.4f    %.4f    %-10.2f  %-10.4f\n",
 			i+1, it.ID, it.Category, it.CTR, it.CVR, it.eCPM, it.Score)
 	}
-	store.Set("final_result", items)
+	dctx.Set("final_result", items)
 	return nil
 }

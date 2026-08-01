@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-func TestSharedStore_SetGet(t *testing.T) {
-	s := NewSharedStore()
+func TestDAGContext_SetGet(t *testing.T) {
+	s := NewDAGContext()
 	s.Set("key", "value")
 
 	v, ok := s.Get("key")
@@ -20,8 +20,8 @@ func TestSharedStore_SetGet(t *testing.T) {
 	}
 }
 
-func TestSharedStore_MustGet(t *testing.T) {
-	s := NewSharedStore()
+func TestDAGContext_MustGet(t *testing.T) {
+	s := NewDAGContext()
 	s.Set("k", 42)
 
 	v := s.MustGet("k")
@@ -30,8 +30,8 @@ func TestSharedStore_MustGet(t *testing.T) {
 	}
 }
 
-func TestSharedStore_MustGet_Panics(t *testing.T) {
-	s := NewSharedStore()
+func TestDAGContext_MustGet_Panics(t *testing.T) {
+	s := NewDAGContext()
 
 	defer func() {
 		if r := recover(); r == nil {
@@ -42,7 +42,7 @@ func TestSharedStore_MustGet_Panics(t *testing.T) {
 }
 
 func TestGetTyped(t *testing.T) {
-	s := NewSharedStore()
+	s := NewDAGContext()
 	s.Set("num", 100)
 
 	v, err := GetTyped[int](s, "num")
@@ -55,7 +55,7 @@ func TestGetTyped(t *testing.T) {
 }
 
 func TestGetTyped_WrongType(t *testing.T) {
-	s := NewSharedStore()
+	s := NewDAGContext()
 	s.Set("num", "not-an-int")
 
 	_, err := GetTyped[int](s, "num")
@@ -65,15 +65,15 @@ func TestGetTyped_WrongType(t *testing.T) {
 }
 
 func TestGetTyped_Missing(t *testing.T) {
-	s := NewSharedStore()
+	s := NewDAGContext()
 	_, err := GetTyped[int](s, "missing")
 	if err == nil {
 		t.Fatal("expected missing key error")
 	}
 }
 
-func TestSharedStore_Keys(t *testing.T) {
-	s := NewSharedStore()
+func TestDAGContext_Keys(t *testing.T) {
+	s := NewDAGContext()
 	s.Set("a", 1)
 	s.Set("b", 2)
 
@@ -83,10 +83,10 @@ func TestSharedStore_Keys(t *testing.T) {
 	}
 }
 
-func TestSharedStore_Len(t *testing.T) {
-	s := NewSharedStore()
+func TestDAGContext_Len(t *testing.T) {
+	s := NewDAGContext()
 	if s.Len() != 0 {
-		t.Fatal("expected empty store")
+		t.Fatal("expected empty context")
 	}
 	s.Set("a", 1)
 	if s.Len() != 1 {
@@ -94,19 +94,19 @@ func TestSharedStore_Len(t *testing.T) {
 	}
 }
 
-func TestSharedStore_Reset(t *testing.T) {
-	s := NewSharedStore()
+func TestDAGContext_Reset(t *testing.T) {
+	s := NewDAGContext()
 	s.Set("a", 1)
 	s.Set("b", 2)
 	s.Reset()
 
 	if s.Len() != 0 {
-		t.Fatalf("expected empty store after reset, got %d", s.Len())
+		t.Fatalf("expected empty context after reset, got %d", s.Len())
 	}
 }
 
-func TestSharedStore_ConcurrentReadWrite(t *testing.T) {
-	s := NewSharedStore()
+func TestDAGContext_ConcurrentReadWrite(t *testing.T) {
+	s := NewDAGContext()
 	const goroutines = 100
 	const iterations = 100
 

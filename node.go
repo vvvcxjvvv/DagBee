@@ -70,9 +70,9 @@ func (s RetryStrategy) String() string {
 
 // NodeFunc is the execution function signature for a DAG node.
 //   - ctx carries timeout/cancellation signals
-//   - store is the shared data store for reading upstream outputs and writing this node's output
+//   - dctx is the DAG shared context for reading upstream outputs and writing this node's output
 //   - a nil return indicates success; a non-nil error triggers retry or fallback logic
-type NodeFunc func(ctx context.Context, store *SharedStore) error
+type NodeFunc func(ctx context.Context, dctx *DAGContext) error
 
 // Node represents a single execution unit in the DAG.
 type Node struct {
@@ -86,7 +86,7 @@ type Node struct {
 	Critical      bool // true: failure aborts the DAG; false: failure degrades gracefully
 	Priority      int  // higher value = higher scheduling priority
 	FallbackFn    NodeFunc
-	ConditionFn   func(*SharedStore) bool // when non-nil, node runs only if this returns true
+	ConditionFn   func(*DAGContext) bool // when non-nil, node runs only if this returns true
 }
 
 // NodeOption configures a Node using the functional options pattern.
@@ -131,6 +131,6 @@ func NodeWithDependsOn(deps ...string) NodeOption {
 }
 
 // NodeWithCondition sets a predicate; the node is skipped when it returns false.
-func NodeWithCondition(fn func(*SharedStore) bool) NodeOption {
+func NodeWithCondition(fn func(*DAGContext) bool) NodeOption {
 	return func(n *Node) { n.ConditionFn = fn }
 }

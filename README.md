@@ -12,7 +12,7 @@ A lightweight, production-ready DAG (Directed Acyclic Graph) execution framework
 - **Fallback functions** — provide default data when a node fails
 - **Panic recovery** — a panicking node never crashes the process
 - **Graceful shutdown** — context cancellation stops scheduling and waits for running nodes
-- **SharedStore** — concurrency-safe key-value store for passing data between nodes, with generics support
+- **DAGContext** — concurrency-safe key-value store for passing data between nodes, with generics support
 - **Lifecycle hooks** — BeforeNode / AfterNode / OnNodeSkip / OnDAGComplete
 - **Logger interface** — plug in zap, logrus, or any structured logger
 - **YAML configuration** — declare topology and node settings in YAML; register functions in Go
@@ -46,19 +46,19 @@ func main() {
         dagbee.WithTimeout(5*time.Second),
     )
 
-    d.AddNode("A", func(ctx context.Context, s *dagbee.SharedStore) error {
-        s.Set("greeting", "hello")
+    d.AddNode("A", func(ctx context.Context, dctx *dagbee.DAGContext) error {
+        dctx.Set("greeting", "hello")
         return nil
     }, dagbee.NodeWithPriority(10))
 
-    d.AddNode("B", func(ctx context.Context, s *dagbee.SharedStore) error {
-        s.Set("name", "world")
+    d.AddNode("B", func(ctx context.Context, dctx *dagbee.DAGContext) error {
+        dctx.Set("name", "world")
         return nil
     }, dagbee.NodeWithPriority(5))
 
-    d.AddNode("C", func(ctx context.Context, s *dagbee.SharedStore) error {
-        g, _ := dagbee.GetTyped[string](s, "greeting")
-        n, _ := dagbee.GetTyped[string](s, "name")
+    d.AddNode("C", func(ctx context.Context, dctx *dagbee.DAGContext) error {
+        g, _ := dagbee.GetTyped[string](dctx, "greeting")
+        n, _ := dagbee.GetTyped[string](dctx, "name")
         fmt.Printf("%s, %s!\n", g, n)
         return nil
     },
@@ -167,7 +167,7 @@ d, err := dagbee.LoadDAGFromYAML("examples/recommend/pipeline.yaml", registry)
 ```
 User Layer       Core Layer            Engine Layer            Data Layer
 ┌──────────┐    ┌──────────────┐      ┌───────────────┐      ┌─────────────┐
-│ Go API   │───►│ DAG          │─────►│ Engine        │─────►│ SharedStore │
+│ Go API   │───►│ DAG          │─────►│ Engine        │─────►│ DAGContext │
 │ YAML Cfg │    │ Node         │      │ Scheduler     │      │ DagResult   │
 └──────────┘    │ Validator    │      │ Executor      │      │ Hooks       │
                 └──────────────┘      └───────────────┘      │ Logger      │
@@ -185,7 +185,7 @@ go test -bench=. -benchmem ./...  # benchmarks
 
 ```bash
 go test -run '^$' -bench 'BenchmarkEngineRun_(WideDAG|DeepDAG|FanOutFanIn|RetryAmplification|ParallelRequests)$' -benchmem ./...
-go test -run '^$' -bench 'BenchmarkSharedStore_HotKeyContention$' -benchmem ./...
+go test -run '^$' -bench 'BenchmarkDAGContext_HotKeyContention$' -benchmem ./...
 go test -run '^$' -bench 'BenchmarkEngineRun_ParallelRequests$' -benchmem -cpuprofile cpu.out -memprofile mem.out ./...
 ```
 
@@ -196,7 +196,7 @@ Scenarios included:
 - `BenchmarkEngineRun_FanOutFanIn`: fan-out/fan-in merge pressure
 - `BenchmarkEngineRun_RetryAmplification`: retry-driven load amplification
 - `BenchmarkEngineRun_ParallelRequests`: many concurrent requests, each running one DAG
-- `BenchmarkSharedStore_HotKeyContention`: `SharedStore` hot-key lock contention
+- `BenchmarkDAGContext_HotKeyContention`: `DAGContext` hot-key lock contention
 
 ## Project Structure
 
@@ -212,7 +212,7 @@ dagbee/
 ├── scheduler.go        Priority-based ready-queue (container/heap)
 │
 │── Data ─────────────────────────────────────────────
-├── store.go            SharedStore: concurrent key-value store
+├── dagcontext.go            DAGContext: concurrent key-value store
 ├── result.go           NodeResult / DagResult + sync.Pool
 │
 │── Support ──────────────────────────────────────────
@@ -227,7 +227,7 @@ dagbee/
 │── Tests ────────────────────────────────────────────
 ├── dag_test.go         DAG construction, cycle detection tests
 ├── engine_test.go      Engine scheduling, concurrency, fault tolerance tests
-├── store_test.go       SharedStore concurrency safety tests
+├── dagcontext_test.go       DAGContext concurrency safety tests
 ├── benchmark_test.go   Performance benchmarks
 │
 │── Examples & Docs ──────────────────────────────────

@@ -47,12 +47,12 @@
 
 #### 4. 数据传递（P1 重要）
 
-- 框架层提供线程安全的 **SharedStore（共享数据仓库）**：
+- 框架层提供线程安全的 **DAGContext（DAG 上下文）**：
   - key-value 存取，支持泛型辅助函数或类型断言辅助函数；
   - 读写并发安全（细粒度锁或 `sync.Map`）；
   - 贯穿整个 DAG 执行生命周期；
 - 业务层允许用户自定义强类型的结构体作为节点间传递的数据载体；
-- SharedStore 在 DAG 执行前初始化，执行后可整体读取。
+- DAGContext 在 DAG 执行前初始化，执行后可整体读取。
 
 #### 5. 可观测性（P1 重要）
 
@@ -73,7 +73,7 @@
 #### 7. 子DAG / DAG 嵌套（P2 可选）
 
 - 支持将一个完整 DAG 作为另一个 DAG 中的一个节点执行（子DAG）；
-- 子DAG 共享父 DAG 的 Context 和 SharedStore，但拥有独立的执行状态追踪；
+- 子DAG 共享父 DAG 的 Context 和 DAGContext，但拥有独立的执行状态追踪；
 - 可用于封装可复用的子流程（如"召回子流程"、"排序子流程"）。
 
 #### 8. Dry-Run 模式（P2 可选）
@@ -163,7 +163,7 @@ dag:
 | **DAG** | 由 Node 和 Edge 构成的有向无环图，代表一个完整的任务编排。 |
 | **Engine** | DAG 的执行引擎，负责拓扑排序、并发调度、结果收集。 |
 | **Scheduler** | 从 Engine 中拆出的调度策略模块，负责就绪节点的优先级排序、并发度管控，方便后续替换调度策略。 |
-| **SharedStore** | 节点间的共享数据仓库，提供并发安全的 key-value 读写，贯穿整个 DAG 执行生命周期。 |
+| **DAGContext** | 节点间的 DAG 上下文，提供并发安全的 key-value 读写，贯穿整个 DAG 执行生命周期。 |
 | **NodeResult** | 节点的执行结果，包含输出数据、执行耗时、错误信息、执行状态等。 |
 | **DagResult** | DAG 整体的执行结果，包含所有节点的 NodeResult、总耗时、执行状态等。 |
 | **Hook** | 生命周期钩子，包括 BeforeNode / AfterNode / OnNodeSkip / OnDAGComplete，用于监控与扩展。 |
@@ -186,7 +186,7 @@ dagbee/
 ├── scheduler.go        // 调度策略：优先级、并发度、就绪队列管理
 │
 │── Data（数据层）───────────────────────────────
-├── store.go            // SharedStore：并发安全的节点间数据传递
+├── dagcontext.go            // DAGContext：并发安全的节点间数据传递
 ├── result.go           // NodeResult / DagResult 定义与对象池
 │
 │── Support（支撑层）────────────────────────────
@@ -201,7 +201,7 @@ dagbee/
 │── Tests（测试）────────────────────────────────
 ├── dag_test.go         // DAG 构建、环检测单元测试
 ├── engine_test.go      // 引擎调度、并发执行、容错逻辑测试
-├── store_test.go       // SharedStore 并发安全测试
+├── dagcontext_test.go       // DAGContext 并发安全测试
 ├── benchmark_test.go   // 关键路径性能基准测试
 │
 │── Examples & Docs（示例与文档）─────────────────
@@ -228,7 +228,7 @@ dagbee/
 
 #### 3. 测试要求
 
-- **单元测试**：核心模块（拓扑排序、环检测、调度引擎、重试逻辑、SharedStore）需有完整的单元测试，覆盖率 > 80%；
+- **单元测试**：核心模块（拓扑排序、环检测、调度引擎、重试逻辑、DAGContext）需有完整的单元测试，覆盖率 > 80%；
 - **基准测试（Benchmark）**：提供关键路径的性能基准测试（DAG 构建耗时、调度延迟、并发执行吞吐量）；
 - **集成测试**：提供端到端的 DAG 执行集成测试用例，覆盖正常流程、超时、重试、降级、Panic 恢复等场景。
 
@@ -279,9 +279,9 @@ fmt.Println(result.NodeResult("merge_and_rank").Output)
 ```go
 // NodeFunc 是节点的执行函数签名
 // ctx: 携带超时控制和取消信号的 context
-// store: 共享数据仓库，用于读取上游数据和写入本节点输出
+// dctx: DAG 上下文，用于读取上游数据和写入本节点输出
 // 返回 error：nil 表示成功，非 nil 触发重试或降级逻辑
-type NodeFunc func(ctx context.Context, store *SharedStore) error
+type NodeFunc func(ctx context.Context, dctx *DAGContext) error
 ```
 
 ---

@@ -114,10 +114,10 @@ func BenchmarkEngineRun_ParallelRequests(b *testing.B) {
 	}
 }
 
-func BenchmarkSharedStore_HotKeyContention(b *testing.B) {
+func BenchmarkDAGContext_HotKeyContention(b *testing.B) {
 	for _, readersPerWrite := range []int{1, 4, 16} {
 		b.Run(fmt.Sprintf("readersPerWrite=%d", readersPerWrite), func(b *testing.B) {
-			store := NewSharedStore()
+			dctx := NewDAGContext()
 			var seq uint64
 
 			b.ReportAllocs()
@@ -126,10 +126,10 @@ func BenchmarkSharedStore_HotKeyContention(b *testing.B) {
 				for pb.Next() {
 					n := atomic.AddUint64(&seq, 1)
 					if n%uint64(readersPerWrite+1) == 0 {
-						store.Set("hot", n)
+						dctx.Set("hot", n)
 						continue
 					}
-					store.Get("hot")
+					dctx.Get("hot")
 				}
 			})
 		})
@@ -213,7 +213,7 @@ func buildParallelRequestDAG(branches, maxConcurrency int, branchLatency time.Du
 }
 
 func makeSleepNode(d time.Duration) NodeFunc {
-	return func(ctx context.Context, _ *SharedStore) error {
+	return func(ctx context.Context, _ *DAGContext) error {
 		select {
 		case <-time.After(d):
 			return nil
@@ -224,35 +224,35 @@ func makeSleepNode(d time.Duration) NodeFunc {
 }
 
 func makeStoreWriteNode(prefix string, branches int) NodeFunc {
-	return func(_ context.Context, store *SharedStore) error {
+	return func(_ context.Context, dctx *DAGContext) error {
 		for i := 0; i < branches; i++ {
-			store.Set(prefix+strconv.Itoa(i), i)
+			dctx.Set(prefix+strconv.Itoa(i), i)
 		}
 		return nil
 	}
 }
 
 func makeStoreReadWriteJoinNode(branches int) NodeFunc {
-	return func(_ context.Context, store *SharedStore) error {
+	return func(_ context.Context, dctx *DAGContext) error {
 		total := 0
 		for i := 0; i < branches; i++ {
 			key := fmt.Sprintf("branch_%d", i)
-			if v, ok := store.Get(key); ok {
+			if v, ok := dctx.Get(key); ok {
 				if iv, ok := v.(int); ok {
 					total += iv
 				}
 			}
 		}
-		store.Set("join_total", total)
+		dctx.Set("join_total", total)
 		return nil
 	}
 }
 
 func makeSleepAndWriteNode(key string, d time.Duration, value int) NodeFunc {
-	return func(ctx context.Context, store *SharedStore) error {
+	return func(ctx context.Context, dctx *DAGContext) error {
 		select {
 		case <-time.After(d):
-			store.Set(key, value)
+			dctx.Set(key, value)
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
@@ -262,13 +262,13 @@ func makeSleepAndWriteNode(key string, d time.Duration, value int) NodeFunc {
 
 func makeStoreBackedFailThenSucceedNode(nodeName string, failuresBeforeSuccess int32) NodeFunc {
 	attemptKey := "__attempts__" + nodeName
-	return func(_ context.Context, store *SharedStore) error {
+	return func(_ context.Context, dctx *DAGContext) error {
 		var attempts int32
-		if v, ok := store.Get(attemptKey); ok {
+		if v, ok := dctx.Get(attemptKey); ok {
 			attempts = v.(int32)
 		}
 		attempts++
-		store.Set(attemptKey, attempts)
+		dctx.Set(attemptKey, attempts)
 		if attempts <= failuresBeforeSuccess {
 			return errSyntheticRetry
 		}

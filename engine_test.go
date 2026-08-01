@@ -12,7 +12,7 @@ import (
 // ---------- helpers ----------
 
 func sleepNode(d time.Duration) NodeFunc {
-	return func(ctx context.Context, store *SharedStore) error {
+	return func(ctx context.Context, dctx *DAGContext) error {
 		select {
 		case <-time.After(d):
 			return nil
@@ -23,27 +23,27 @@ func sleepNode(d time.Duration) NodeFunc {
 }
 
 func failNode(err error) NodeFunc {
-	return func(_ context.Context, _ *SharedStore) error { return err }
+	return func(_ context.Context, _ *DAGContext) error { return err }
 }
 
 func panicNode(val interface{}) NodeFunc {
-	return func(_ context.Context, _ *SharedStore) error { panic(val) }
+	return func(_ context.Context, _ *DAGContext) error { panic(val) }
 }
 
 // ---------- tests ----------
 
 func TestEngine_SimpleSerial(t *testing.T) {
 	d := NewDAG("serial")
-	d.AddNode("A", func(_ context.Context, s *SharedStore) error {
+	d.AddNode("A", func(_ context.Context, s *DAGContext) error {
 		s.Set("seq", "A")
 		return nil
 	})
-	d.AddNode("B", func(_ context.Context, s *SharedStore) error {
+	d.AddNode("B", func(_ context.Context, s *DAGContext) error {
 		v, _ := GetTyped[string](s, "seq")
 		s.Set("seq", v+"B")
 		return nil
 	}, NodeWithDependsOn("A"))
-	d.AddNode("C", func(_ context.Context, s *SharedStore) error {
+	d.AddNode("C", func(_ context.Context, s *DAGContext) error {
 		v, _ := GetTyped[string](s, "seq")
 		s.Set("seq", v+"C")
 		return nil
@@ -66,7 +66,7 @@ func TestEngine_ParallelExecution(t *testing.T) {
 	var counter int32
 	for i := 0; i < 4; i++ {
 		name := fmt.Sprintf("N%d", i)
-		d.AddNode(name, func(_ context.Context, _ *SharedStore) error {
+		d.AddNode(name, func(_ context.Context, _ *DAGContext) error {
 			atomic.AddInt32(&counter, 1)
 			time.Sleep(50 * time.Millisecond)
 			return nil
@@ -91,13 +91,13 @@ func TestEngine_ParallelExecution(t *testing.T) {
 
 func TestEngine_FanOutFanIn(t *testing.T) {
 	d := NewDAG("fan", WithMaxConcurrency(4))
-	d.AddNode("root", func(_ context.Context, s *SharedStore) error {
+	d.AddNode("root", func(_ context.Context, s *DAGContext) error {
 		s.Set("root", 1)
 		return nil
 	})
 	for i := 0; i < 3; i++ {
 		name := fmt.Sprintf("branch_%d", i)
-		d.AddNode(name, func(_ context.Context, s *SharedStore) error {
+		d.AddNode(name, func(_ context.Context, s *DAGContext) error {
 			time.Sleep(30 * time.Millisecond)
 			return nil
 		}, NodeWithDependsOn("root"), NodeWithCritical(false))
@@ -113,7 +113,7 @@ func TestEngine_FanOutFanIn(t *testing.T) {
 
 func TestEngine_NodeTimeout(t *testing.T) {
 	d := NewDAG("timeout")
-	d.AddNode("slow", func(ctx context.Context, _ *SharedStore) error {
+	d.AddNode("slow", func(ctx context.Context, _ *DAGContext) error {
 		select {
 		case <-time.After(5 * time.Second):
 			return nil
@@ -133,7 +133,7 @@ func TestEngine_RetrySuccess(t *testing.T) {
 	var attempts int32
 
 	d := NewDAG("retry")
-	d.AddNode("flaky", func(_ context.Context, _ *SharedStore) error {
+	d.AddNode("flaky", func(_ context.Context, _ *DAGContext) error {
 		if atomic.AddInt32(&attempts, 1) < 3 {
 			return errors.New("not yet")
 		}
@@ -205,7 +205,7 @@ func TestEngine_FallbackSuccess(t *testing.T) {
 	d := NewDAG("fallback")
 	d.AddNode("A", failNode(errors.New("primary failed")),
 		NodeWithCritical(true),
-		NodeWithFallback(func(_ context.Context, s *SharedStore) error {
+		NodeWithFallback(func(_ context.Context, s *DAGContext) error {
 			s.Set("A", "fallback_data")
 			return nil
 		}),
@@ -259,7 +259,7 @@ func TestEngine_ConcurrencyControl(t *testing.T) {
 
 	for i := 0; i < 6; i++ {
 		name := fmt.Sprintf("N%d", i)
-		d.AddNode(name, func(_ context.Context, _ *SharedStore) error {
+		d.AddNode(name, func(_ context.Context, _ *DAGContext) error {
 			cur := atomic.AddInt32(&running, 1)
 			for {
 				old := atomic.LoadInt32(&maxRunning)
@@ -286,7 +286,7 @@ func TestEngine_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	d := NewDAG("cancel")
-	d.AddNode("A", func(ctx context.Context, _ *SharedStore) error {
+	d.AddNode("A", func(ctx context.Context, _ *DAGContext) error {
 		cancel() // cancel after node A starts
 		time.Sleep(20 * time.Millisecond)
 		return nil
@@ -301,16 +301,16 @@ func TestEngine_ContextCancellation(t *testing.T) {
 
 func TestEngine_ConditionSkip(t *testing.T) {
 	d := NewDAG("cond")
-	d.AddNode("A", func(_ context.Context, s *SharedStore) error {
+	d.AddNode("A", func(_ context.Context, s *DAGContext) error {
 		s.Set("flag", false)
 		return nil
 	})
-	d.AddNode("B", func(_ context.Context, s *SharedStore) error {
+	d.AddNode("B", func(_ context.Context, s *DAGContext) error {
 		s.Set("B_ran", true)
 		return nil
 	},
 		NodeWithDependsOn("A"),
-		NodeWithCondition(func(s *SharedStore) bool {
+		NodeWithCondition(func(s *DAGContext) bool {
 			v, _ := GetTyped[bool](s, "flag")
 			return v
 		}),
@@ -332,7 +332,7 @@ func TestEngine_Priority(t *testing.T) {
 
 	var order []string
 	addTrackingNode := func(name string, priority int) {
-		d.AddNode(name, func(_ context.Context, _ *SharedStore) error {
+		d.AddNode(name, func(_ context.Context, _ *DAGContext) error {
 			order = append(order, name)
 			return nil
 		}, NodeWithPriority(priority))
@@ -393,7 +393,7 @@ func TestEngine_ExponentialBackoff(t *testing.T) {
 	var attempts int32
 
 	d := NewDAG("exp-backoff")
-	d.AddNode("flaky", func(_ context.Context, _ *SharedStore) error {
+	d.AddNode("flaky", func(_ context.Context, _ *DAGContext) error {
 		if atomic.AddInt32(&attempts, 1) < 3 {
 			return errors.New("not yet")
 		}

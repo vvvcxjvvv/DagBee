@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func noop(_ context.Context, _ *SharedStore) error { return nil }
+func noop(_ context.Context, _ *DAGContext) error { return nil }
 
 func TestNewDAG(t *testing.T) {
 	d := NewDAG("test")

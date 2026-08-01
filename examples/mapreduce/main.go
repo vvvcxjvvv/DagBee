@@ -41,7 +41,7 @@ brown dog lazy fox the quick brown dog the lazy fox jumps`
 	)
 
 	// --- Phase 1: Split ---
-	d.AddNode("split", func(ctx context.Context, store *dagbee.SharedStore) error {
+	d.AddNode("split", func(ctx context.Context, dctx *dagbee.DAGContext) error {
 		words := strings.Fields(input)
 		size := (len(words) + numMappers - 1) / numMappers
 		chunks := make([][]string, numMappers)
@@ -53,7 +53,7 @@ brown dog lazy fox the quick brown dog the lazy fox jumps`
 			}
 			chunks[i] = words[start:end]
 		}
-		store.Set("chunks", chunks)
+		dctx.Set("chunks", chunks)
 		return nil
 	}, dagbee.NodeWithPriority(100))
 
@@ -64,8 +64,8 @@ brown dog lazy fox the quick brown dog the lazy fox jumps`
 		name := fmt.Sprintf("map_%d", idx)
 		mapDeps = append(mapDeps, name)
 
-		d.AddNode(name, func(ctx context.Context, store *dagbee.SharedStore) error {
-			chunks, _ := dagbee.GetTyped[[][]string](store, "chunks")
+		d.AddNode(name, func(ctx context.Context, dctx *dagbee.DAGContext) error {
+			chunks, _ := dagbee.GetTyped[[][]string](dctx, "chunks")
 			partitions := make([]map[string]int, numReducers)
 			for r := 0; r < numReducers; r++ {
 				partitions[r] = make(map[string]int)
@@ -74,7 +74,7 @@ brown dog lazy fox the quick brown dog the lazy fox jumps`
 				r := hashPartition(w, numReducers)
 				partitions[r][w]++
 			}
-			store.Set(fmt.Sprintf("map_%d_partitions", idx), partitions)
+			dctx.Set(fmt.Sprintf("map_%d_partitions", idx), partitions)
 			return nil
 		}, dagbee.NodeWithDependsOn("split"), dagbee.NodeWithPriority(50-idx))
 	}
@@ -86,15 +86,15 @@ brown dog lazy fox the quick brown dog the lazy fox jumps`
 		name := fmt.Sprintf("shuffle_%d", rIdx)
 		shuffleDeps = append(shuffleDeps, name)
 
-		d.AddNode(name, func(ctx context.Context, store *dagbee.SharedStore) error {
+		d.AddNode(name, func(ctx context.Context, dctx *dagbee.DAGContext) error {
 			merged := make(map[string]int)
 			for m := 0; m < numMappers; m++ {
-				partitions, _ := dagbee.GetTyped[[]map[string]int](store, fmt.Sprintf("map_%d_partitions", m))
+				partitions, _ := dagbee.GetTyped[[]map[string]int](dctx, fmt.Sprintf("map_%d_partitions", m))
 				for w, c := range partitions[rIdx] {
 					merged[w] += c
 				}
 			}
-			store.Set(fmt.Sprintf("shuffle_%d_merged", rIdx), merged)
+			dctx.Set(fmt.Sprintf("shuffle_%d_merged", rIdx), merged)
 			return nil
 		}, dagbee.NodeWithDependsOn(mapDeps...), dagbee.NodeWithPriority(20-rIdx))
 	}
@@ -106,8 +106,8 @@ brown dog lazy fox the quick brown dog the lazy fox jumps`
 		name := fmt.Sprintf("reduce_%d", rIdx)
 		reduceDeps = append(reduceDeps, name)
 
-		d.AddNode(name, func(ctx context.Context, store *dagbee.SharedStore) error {
-			merged, _ := dagbee.GetTyped[map[string]int](store, fmt.Sprintf("shuffle_%d_merged", rIdx))
+		d.AddNode(name, func(ctx context.Context, dctx *dagbee.DAGContext) error {
+			merged, _ := dagbee.GetTyped[map[string]int](dctx, fmt.Sprintf("shuffle_%d_merged", rIdx))
 			keys := make([]string, 0, len(merged))
 			for k := range merged {
 				keys = append(keys, k)
@@ -117,16 +117,16 @@ brown dog lazy fox the quick brown dog the lazy fox jumps`
 			for _, k := range keys {
 				entries = append(entries, wordCount{Word: k, Count: merged[k]})
 			}
-			store.Set(fmt.Sprintf("reduce_%d_result", rIdx), entries)
+			dctx.Set(fmt.Sprintf("reduce_%d_result", rIdx), entries)
 			return nil
 		}, dagbee.NodeWithDependsOn(fmt.Sprintf("shuffle_%d", r)), dagbee.NodeWithPriority(10-r))
 	}
 
 	// --- Phase 5: Merge final results ---
-	d.AddNode("merge", func(ctx context.Context, store *dagbee.SharedStore) error {
+	d.AddNode("merge", func(ctx context.Context, dctx *dagbee.DAGContext) error {
 		final := make(map[string]int)
 		for r := 0; r < numReducers; r++ {
-			entries, _ := dagbee.GetTyped[[]wordCount](store, fmt.Sprintf("reduce_%d_result", r))
+			entries, _ := dagbee.GetTyped[[]wordCount](dctx, fmt.Sprintf("reduce_%d_result", r))
 			for _, e := range entries {
 				final[e.Word] += e.Count
 			}
@@ -140,7 +140,7 @@ brown dog lazy fox the quick brown dog the lazy fox jumps`
 		for _, w := range keys {
 			fmt.Printf("  %-12s %d\n", w, final[w])
 		}
-		store.Set("final_counts", final)
+		dctx.Set("final_counts", final)
 		return nil
 	}, dagbee.NodeWithDependsOn(reduceDeps...), dagbee.NodeWithPriority(1))
 

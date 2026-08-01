@@ -16,25 +16,25 @@ func main() {
 	)
 
 	// A and B run in parallel; C depends on both.
-	d.AddNode("A", func(ctx context.Context, store *dagbee.SharedStore) error {
+	d.AddNode("A", func(ctx context.Context, dctx *dagbee.DAGContext) error {
 		time.Sleep(100 * time.Millisecond)
-		store.Set("a_result", 42)
+		dctx.Set("a_result", 42)
 		fmt.Println("  [A] done")
 		return nil
 	}, dagbee.NodeWithPriority(10))
 
-	d.AddNode("B", func(ctx context.Context, store *dagbee.SharedStore) error {
+	d.AddNode("B", func(ctx context.Context, dctx *dagbee.DAGContext) error {
 		time.Sleep(80 * time.Millisecond)
-		store.Set("b_result", "hello")
+		dctx.Set("b_result", "hello")
 		fmt.Println("  [B] done")
 		return nil
 	}, dagbee.NodeWithPriority(5))
 
-	d.AddNode("C", func(ctx context.Context, store *dagbee.SharedStore) error {
-		a, _ := dagbee.GetTyped[int](store, "a_result")
-		b, _ := dagbee.GetTyped[string](store, "b_result")
+	d.AddNode("C", func(ctx context.Context, dctx *dagbee.DAGContext) error {
+		a, _ := dagbee.GetTyped[int](dctx, "a_result")
+		b, _ := dagbee.GetTyped[string](dctx, "b_result")
 		fmt.Printf("  [C] received a=%d, b=%q\n", a, b)
-		store.Set("c_result", fmt.Sprintf("merged(%d, %s)", a, b))
+		dctx.Set("c_result", fmt.Sprintf("merged(%d, %s)", a, b))
 		return nil
 	}, dagbee.NodeWithDependsOn("A", "B"), dagbee.NodeWithPriority(10))
 

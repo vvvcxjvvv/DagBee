@@ -56,8 +56,8 @@ func BenchmarkEngineRun_Serial_10(b *testing.B) {
 	}
 }
 
-func BenchmarkSharedStore_ConcurrentRW(b *testing.B) {
-	s := NewSharedStore()
+func BenchmarkDAGContext_ConcurrentRW(b *testing.B) {
+	s := NewDAGContext()
 	var wg sync.WaitGroup
 
 	b.ResetTimer()
