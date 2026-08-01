@@ -157,6 +157,10 @@ func NodeWithSubflow(fn SubflowFunc) NodeOption {
 // are activated — all others are marked Skipped. The downstream nodes should
 // also be declared via NodeWithDependsOn so that edges are registered.
 //
+// A single index can map to multiple downstream nodes (RouteMap value is
+// []string), enabling multi-branch activation: e.g. {0: {"a","b"}} activates
+// both a and b simultaneously.
+//
 // RouteFn and ConditionFn are mutually exclusive: a node cannot be both a
 // gate (skip self) and a router (select downstream). Setting both is rejected
 // by Validate.

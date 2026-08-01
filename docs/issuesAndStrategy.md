@@ -588,7 +588,7 @@ Event loop 从 4 路 select 降为 3 路：
 
 对比 5 个方案：保持现状（per-node ConditionFn 路由）、RouteFn + RouteMap（条件边组）、SwitchFn + 位置数组、运行时动态边剪枝、C++ Taskflow 强弱依赖模型。
 
-选择 **RouteFn + RouteMap**。路由逻辑集中在一个函数，RouteMap 用显式 map 支持稀疏索引和多分支激活，复用现有 Skipped 回流机制，不破坏 pending 模型。详见 `docs/route-condition-design.md`。
+选择 **RouteFn + RouteMap**。路由逻辑集中在一个函数，RouteMap 用显式 map 支持稀疏索引和多分支激活（一个索引可映射多个下游节点，`RouteMap[int][]string`），复用现有 Skipped 回流机制，不破坏 pending 模型。详见 `docs/route-condition-design.md`。
 
 ### 落地实现
 

@@ -17,7 +17,7 @@ A lightweight, production-ready DAG (Directed Acyclic Graph) execution framework
 - **Logger interface** — plug in zap, logrus, or any structured logger
 - **YAML configuration** — declare topology and node settings in YAML; register functions in Go
 - **Conditional execution** — skip nodes based on runtime predicates
-- **Route branching** — if/else if/else multi-branch routing via RouteFn + RouteMap
+- **Route branching** — multi-branch routing via RouteFn + RouteMap; one index can activate multiple downstream nodes simultaneously
 - **Subflow** — dynamically generate and execute child DAGs at runtime with shared DAGContext, shared worker pool, and async dispatch (no worker blocking)- **Visualization** — text-based topological layer output for debugging
 - **Object pooling** — `sync.Pool` reuse of DagResult / NodeResult to reduce GC pressure
 - **Near-zero framework overhead** — ~7μs to build a 20-node DAG, ~1.3μs scheduling per node, ~360B memory per node
@@ -153,7 +153,7 @@ d, err := dagbee.LoadDAGFromYAML("examples/recommend/pipeline.yaml", registry)
 | `NodeWithFallback(fn)` | Fallback function when all retries fail |
 | `NodeWithDependsOn(names...)` | Upstream dependency declarations |
 | `NodeWithCondition(fn)` | Predicate gate — skip when false |
-| `NodeWithRoute(fn, map)` | Route node — select downstream branches by index |
+| `NodeWithRoute(fn, map)` | Route node — select downstream branch group by index (one-to-many supported) |
 | `NodeWithSubflow(fn)` | Dynamic child DAG generation (subflow node) |
 ## DAG Options
 
