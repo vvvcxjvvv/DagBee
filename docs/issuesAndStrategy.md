@@ -433,6 +433,151 @@ type NodeResult struct {
 
 ---
 
+## #4 Subflow 同步阻塞 → 异步调度重构
+
+### 当前问题
+
+Subflow 节点采用同步阻塞模型：worker 拿到 subflow 节点后递归调用 `executeDAG`，整个子图跑完才释放 worker。通过 `stealCh`（depth > 0 时 `stealCh = wp.readyCh`）被动窃取任务来缓解死锁，但存在三个根本缺陷：
+
+1. **stealCh 是补丁不是根治** — 顶层 DAG（depth=0）无窃取能力；窃取到长耗时任务拖慢自身事件循环；无任务可偷时依旧卡死，只降低概率不根治。
+2. **worker 长期占用** — 整个子图执行期间 worker 槽位被占，高并发多层 subflow 时可用 worker 急剧减少。
+3. **递归栈深度** — `executeDAG` 递归调用，嵌套层级深时栈帧累积（虽有 maxSubflowDepth 限制，但架构不优雅）。
+
+### 策略抉择
+
+#### 方案 A：保持同步模型，增强 stealCh
+
+移除 `depth > 0` 限制，全层级支持窃取；增加主动扫描逻辑。
+
+| 优点 | 缺点 |
+|------|------|
+| 改动最小 | 仍需 worker 阻塞等待子图完成 |
+| 不改变核心调度模型 | select 分支复杂度增加 |
+| | 顶层窃取会超出并发限制（Run goroutine 非_worker） |
+| | 本质仍是同步阻塞，性能上限受限 |
+
+#### 方案 B：异步 Join 模型（worker 不阻塞）
+
+Worker 仅同步执行 `SubflowFn` 构图（带 panic recovery），构图完成后子 DAG 节点批量推入 `wp.readyCh`，worker 立即释放。子图在独立 goroutine 中调度（不占 worker slot），完成后通过 `doneCh` 通知父 DAG 回填 `SubflowResult`。
+
+对标 C++ Taskflow corun（worker 不阻塞，子任务进全局队列）和 Temporal Child Workflow（完全异步 Future）。
+
+| 优点 | 缺点 |
+|------|------|
+| Worker 零阻塞，并发利用率最优 | 引入 per-subflow goroutine（通常很少，影响小） |
+| 删除 stealCh，event loop 从 4 路 select 降为 3 路 | subflow 完成通知通过 doneCh 异步，需保证 channel buffer 充足 |
+| 无递归调用，栈深度恒定 | goroutine 生命周期管理需确保 dagCtx 取消时正确退出 |
+| 子图节点与父图节点公平竞争 worker | |
+
+#### 方案 C：Per-worker Work-Stealing Queue (BWSQ)
+
+每个 worker 绑定独立无锁本地队列，空闲时跨线程偷取。对标 C++ Taskflow 的 BWSQ。
+
+| 优点 | 缺点 |
+|------|------|
+| 真正的负载均衡，降低长尾延迟 | 实现复杂度极高（无锁队列、内存序） |
+| 对标业界最优实现 | Go 中 channel 已经足够高效，BWSQ 收益有限 |
+| | 超出当前框架定位，过度工程化 |
+
+#### 抉择
+
+选择 **方案 B：异步 Join 模型**。
+
+方案 A 是增量补丁，不解决根本问题。方案 C 是长期方向但当前收益不匹配复杂度。方案 B 以中等改动量实现 worker 零阻塞，删除 stealCh 补丁，简化 event loop，对标业界主流实现。
+
+### 落地实现
+
+**文件**: `engine.go`、`workerpool.go`、`subflow_test.go`、`doc.go`
+
+核心设计变更：
+
+**1. executeNode 签名新增 doneCh 参数**
+
+```go
+func (e *Engine) executeNode(
+    ctx context.Context, n *Node, dctx *DAGContext, d *DAG,
+    wp *workerPool, depth int, logger Logger,
+    doneCh chan<- *NodeResult, // 新增：用于异步 subflow 回填结果
+) *NodeResult
+```
+
+普通节点返回完整 NodeResult（worker 发送到 doneCh）。Subflow 节点返回 nil（worker 跳过发送），由后台 goroutine 在子图完成后发送。
+
+**2. Subflow 分支改为异步**
+
+```go
+if n.SubflowFn != nil {
+    // 1. 同步执行 SubflowFn（带 panic recovery）
+    subDAG, err := n.SubflowFn(ctx, dctx)
+    // 2. 校验、深度检查...
+
+    // 3. 启动后台 goroutine 执行子 DAG
+    result := nr // 局部变量避免命名返回值问题
+    go func() {
+        defer func() {
+            // panic recovery + finalize + doneCh <- result
+        }()
+        subResult := e.executeDAG(ctx, subDAG, dctx, wp, d.hooks, depth+1, logger)
+        result.SubflowResult = subResult
+        // 设置 status...
+    }()
+    return nil // worker 跳过 doneCh 发送
+}
+```
+
+关键点：`result := nr` 做局部拷贝。原始实现使用命名返回值 `(nr *NodeResult)`，`return nil` 会将 `nr` 置为 nil，导致 goroutine 闭包捕获到 nil 指针。改用 `*NodeResult` 返回类型 + 局部变量解决。
+
+**3. Worker pool 适配 nil 结果**
+
+```go
+func (wp *workerPool) worker() {
+    defer wp.wg.Done()
+    for t := range wp.readyCh {
+        if nr := t.exec(t.node); nr != nil {
+            t.doneCh <- nr
+        }
+    }
+}
+```
+
+`exec` 返回 nil 时（异步 subflow），worker 跳过 `doneCh` 发送，直接回到 `range readyCh` 接收下一个任务。
+
+**4. executeDAG 删除 stealCh**
+
+Event loop 从 4 路 select 降为 3 路：
+- `readySendCh <- nextTask`（dispatch ready node to worker）
+- `nr := <-doneCh`（process completion，含异步 subflow 完成通知）
+- `<-ctxDone`（timeout/cancellation）
+
+删除了 `stealCh` 分支和 `depth > 0` 条件判断。
+
+**5. dagCtx.Done() 忙等待修复**
+
+原实现在 `case <-dagCtx.Done()` 后不 nil 化 `ctxDone`，导致后续循环中 Done() channel 始终就绪，select 忙等待。改为首次触发后 `ctxDone = nil`，禁用该 case。
+
+**对比旧方案**：
+
+| 维度 | 旧方案（同步 + stealCh） | 新方案（异步 Join） |
+|------|------------------------|--------------------|
+| worker 占用 | 整个子图执行期间 | 仅 SubflowFn 构图阶段 |
+| 死锁防护 | stealCh 兜底（不彻底） | 不需要，worker 不阻塞 |
+| event loop | 4 路 select | 3 路 select |
+| 栈深度 | 递归 executeDAG | 无递归（goroutine 各自独立栈） |
+| goroutine 数 | worker 数（固定） | worker 数 + 活跃 subflow 层数 |
+| 顶层 DAG 窃取 | 无（depth=0 时 stealCh=nil） | 不需要 |
+
+**测试覆盖**：
+
+| 测试 | 验证内容 |
+|------|---------|
+| `TestSubflow_AsyncMaxConcurrency1` | maxConcurrency=1 时 subflow + sibling 并发执行不阻塞 |
+| `TestSubflow_DeepNesting` | 5 层嵌套不栈溢出，结果递归可访问 |
+| `TestSubflow_DeadlockAvoidance` | maxConcurrency=2 双 subflow 不死锁（20 次连跑） |
+| 现有 10 个 subflow 测试 | 全部通过，API 无破坏性变更 |
+
+56 个测试全部通过，`-race -count=5` 零失败。
+
+
 <!--
 模板（复制后填充）:
 

@@ -88,10 +88,11 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 	return result
 }
 
-// executeDAG runs a single DAG layer within the execution tree. It is
-// reentrant: subflow nodes call it recursively with a child DAG, sharing
-// the same dctx and worker pool. The event loop uses work-stealing to
-// avoid deadlock when workers are blocked in nested subflow event loops.
+// executeDAG runs a single DAG layer within the execution tree.
+// Subflow nodes launch child DAGs in background goroutines that call
+// executeDAG recursively, sharing the same dctx and worker pool.
+// No worker is blocked waiting for child DAG completion — the event
+// loop is a pure scheduler that dispatches tasks and collects results.
 func (e *Engine) executeDAG(
 	ctx context.Context,
 	d *DAG,
@@ -141,8 +142,7 @@ func (e *Engine) executeDAG(
 		}
 	}
 
-	// dispatchReady sends the next ready node to a worker via wp.readyCh.
-	// Called from the event loop's select alongside doneCh.
+	// dispatchReady builds an execTask for the next ready node.
 	dispatchReady := func() *execTask {
 		if scheduler.Len() == 0 {
 			return nil
@@ -151,7 +151,7 @@ func (e *Engine) executeDAG(
 			node:   scheduler.Peek(),
 			doneCh: doneCh,
 			exec: func(node *Node) *NodeResult {
-				return e.executeNode(dagCtx, node, dctx, d, wp, depth, logger)
+				return e.executeNode(dagCtx, node, dctx, d, wp, depth, logger, doneCh)
 			},
 		}
 	}
@@ -167,28 +167,20 @@ func (e *Engine) executeDAG(
 	nextTask := dispatchReady()
 
 	// --- Main event loop ---
-	// The event loop selects on:
-	//   - doneCh: process completed node results
+	// Three-way select:
 	//   - wp.readyCh send: dispatch a ready node to an idle worker
-	//   - stealCh (depth > 0 only): steal and execute a task from another layer
+	//   - doneCh: process completed node results (incl. async subflow)
 	//   - dagCtx.Done(): timeout/cancellation
 	//
-	// The readyCh send case handles both initial dispatch and post-completion
-	// dispatch. It is nil when there are no ready nodes, disabling the case.
-	//
-	// At depth > 0, stealCh = wp.readyCh (enabling work-stealing to prevent
-	// deadlock when all workers are blocked in subflow event loops).
-	// At depth 0, stealCh = nil (the Run goroutine is not a worker).
-	var stealCh chan *execTask
-	if depth > 0 {
-		stealCh = wp.readyCh
-	}
-
+	// readySendCh is nil when there are no ready nodes (nil-channel disables
+	// the select case). ctxDone is nil-ed after first cancellation to avoid
+	// busy-spinning on an always-ready Done() channel.
 	var readySendCh chan *execTask
 	if nextTask != nil {
 		readySendCh = wp.readyCh
 	}
 
+	ctxDone := dagCtx.Done()
 	completed := 0
 	for completed < total {
 		select {
@@ -204,7 +196,7 @@ func (e *Engine) executeDAG(
 			completed++
 			result.Results[nr.NodeName] = nr
 
-			// Critical failure → cancel the entire DAG.
+			// Critical failure -> cancel the entire DAG.
 			if (nr.Status == StatusFailed || nr.Status == StatusPanicked) &&
 				d.nodes[nr.NodeName] != nil && d.nodes[nr.NodeName].Critical {
 				atomic.StoreInt32(&dagFailed, 1)
@@ -225,6 +217,10 @@ func (e *Engine) executeDAG(
 				}
 				readySendCh = nil
 				nextTask = nil
+				// dagCancel() makes Done() permanently ready; nil-ing
+				// ctxDone disables this case so the loop blocks on doneCh
+				// waiting for in-flight nodes instead of busy-spinning.
+				ctxDone = nil
 				continue
 			}
 
@@ -248,13 +244,7 @@ func (e *Engine) executeDAG(
 				}
 			}
 
-		case task := <-stealCh:
-			// Work-stealing (depth > 0 only): execute a ready task from any
-			// DAG layer while waiting for our own doneCh. Prevents deadlock
-			// when all pool workers are blocked in subflow event loops.
-			task.doneCh <- task.exec(task.node)
-
-		case <-dagCtx.Done():
+		case <-ctxDone:
 			if atomic.CompareAndSwapInt32(&dagFailed, 0, 1) && result.Error == nil {
 				result.Error = dagCtx.Err()
 			}
@@ -271,6 +261,7 @@ func (e *Engine) executeDAG(
 			}
 			readySendCh = nil
 			nextTask = nil
+			ctxDone = nil // prevent busy-spin on always-ready Done()
 		}
 	}
 
@@ -287,8 +278,15 @@ func (e *Engine) executeDAG(
 }
 
 // executeNode runs a single node with panic recovery, condition checking,
-// retry logic, fallback handling, and subflow execution. Returns a fully
-// populated NodeResult.
+// retry logic, fallback handling, and subflow execution.
+//
+// For normal nodes, it returns a fully populated NodeResult (the worker
+// sends it to doneCh).
+//
+// For subflow nodes, it runs SubflowFn synchronously (with panic recovery),
+// then launches a background goroutine to execute the child DAG. The
+// goroutine sends the final NodeResult to doneCh when the child completes.
+// executeNode returns nil in this case, signaling the worker not to send.
 func (e *Engine) executeNode(
 	ctx context.Context,
 	n *Node,
@@ -297,27 +295,18 @@ func (e *Engine) executeNode(
 	wp *workerPool,
 	depth int,
 	logger Logger,
-) (nr *NodeResult) {
-	nr = acquireNodeResult()
+	doneCh chan<- *NodeResult,
+) *NodeResult {
+	nr := acquireNodeResult()
 	nr.NodeName = n.Name
 	nr.Status = StatusRunning
 	nr.StartTime = time.Now()
 
-	// Panic recovery — ensures the goroutine never crashes the process.
-	defer func() {
-		if r := recover(); r != nil {
-			nr.Status = StatusPanicked
-			nr.Error = &PanicError{
-				NodeName:   n.Name,
-				Value:      r,
-				Stacktrace: capturePanicStack(),
-			}
-			logger.Error("node panicked", "node", n.Name, "panic", r)
-		}
+	finalize := func() {
 		nr.EndTime = time.Now()
 		nr.Duration = nr.EndTime.Sub(nr.StartTime)
 		d.hooks.AfterNode(ctx, n.Name, nr)
-	}()
+	}
 
 	d.hooks.BeforeNode(ctx, n.Name)
 
@@ -325,73 +314,143 @@ func (e *Engine) executeNode(
 	if n.ConditionFn != nil && !n.ConditionFn(dctx) {
 		nr.Status = StatusSkipped
 		d.hooks.OnNodeSkip(ctx, n.Name, "condition not met")
+		finalize()
 		return nr
 	}
 
 	// --- Subflow branch ---
 	if n.SubflowFn != nil {
-		subDAG, err := n.SubflowFn(ctx, dctx)
-		if err != nil {
-			nr.Status = StatusFailed
-			nr.Error = fmt.Errorf("subflow %q construction failed: %w", n.Name, err)
+		// Construction phase: run SubflowFn synchronously with panic recovery.
+		var subDAG *DAG
+		var constructionErr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					constructionErr = &PanicError{
+						NodeName:   n.Name,
+						Value:      r,
+						Stacktrace: capturePanicStack(),
+					}
+					logger.Error("subflow construction panicked", "node", n.Name, "panic", r)
+				}
+			}()
+			subDAG, constructionErr = n.SubflowFn(ctx, dctx)
+		}()
+
+		if constructionErr != nil {
+			if pe, ok := constructionErr.(*PanicError); ok {
+				nr.Status = StatusPanicked
+				nr.Error = pe
+			} else {
+				nr.Status = StatusFailed
+				nr.Error = fmt.Errorf("subflow %q construction failed: %w", n.Name, constructionErr)
+			}
+			finalize()
 			return nr
 		}
 		if subDAG == nil {
 			nr.Status = StatusSuccess // empty subflow
+			finalize()
 			return nr
 		}
 		if err := subDAG.Validate(); err != nil {
 			nr.Status = StatusFailed
 			nr.Error = fmt.Errorf("subflow %q validation failed: %w", n.Name, err)
+			finalize()
 			return nr
 		}
 		if depth >= e.maxSubflowDepth {
 			nr.Status = StatusFailed
 			nr.Error = fmt.Errorf("subflow %q exceeds max depth %d", n.Name, e.maxSubflowDepth)
+			finalize()
 			return nr
 		}
 
-		// Recursively execute child DAG with shared dctx and wp.
-		// The child's event loop uses work-stealing to avoid deadlock.
-		subResult := e.executeDAG(ctx, subDAG, dctx, wp, d.hooks, depth+1, logger)
-		nr.SubflowResult = subResult
+		// Async execution: launch child DAG in a background goroutine.
+		// The worker is released immediately to pick up other tasks
+		// (including this child DAG's own nodes via wp.readyCh).
+		// The goroutine sends the completed NodeResult to doneCh when
+		// the child DAG finishes.
+		//
+		// nr is captured by pointer; the goroutine owns it from here on.
+		result := nr // local copy so the closure doesn't depend on named return
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					result.Status = StatusPanicked
+					result.Error = &PanicError{
+						NodeName:   n.Name,
+						Value:      r,
+						Stacktrace: capturePanicStack(),
+					}
+					logger.Error("subflow execution panicked", "node", n.Name, "panic", r)
+				}
+				result.EndTime = time.Now()
+				result.Duration = result.EndTime.Sub(result.StartTime)
+				d.hooks.AfterNode(ctx, n.Name, result)
+				doneCh <- result
+			}()
 
-		if subResult.Status == StatusFailed {
-			nr.Status = StatusFailed
-			nr.Error = subResult.Error
-		} else {
-			nr.Status = StatusSuccess
-		}
-		return nr
+			subResult := e.executeDAG(ctx, subDAG, dctx, wp, d.hooks, depth+1, logger)
+			result.SubflowResult = subResult
+
+			if subResult.Status == StatusFailed {
+				result.Status = StatusFailed
+				result.Error = subResult.Error
+			} else {
+				result.Status = StatusSuccess
+			}
+		}()
+		return nil // async: worker must not send to doneCh
 	}
 
 	// --- Normal node: execute with retries ---
-	retries, err := e.executeWithRetries(ctx, n, dctx, logger)
-	nr.RetryCount = retries
+	// Panic recovery wraps the retry loop. Uses a named-return deferred
+	// recover so the panic can mutate the returned value.
+	var retNR *NodeResult
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				nr.Status = StatusPanicked
+				nr.Error = &PanicError{
+					NodeName:   n.Name,
+					Value:      r,
+					Stacktrace: capturePanicStack(),
+				}
+				logger.Error("node panicked", "node", n.Name, "panic", r)
+			}
+			finalize()
+			retNR = nr
+		}()
 
-	if err == nil {
-		if retries > 0 {
-			nr.Status = StatusRetried
-		} else {
-			nr.Status = StatusSuccess
+		retries, err := e.executeWithRetries(ctx, n, dctx, logger)
+		nr.RetryCount = retries
+
+		if err == nil {
+			if retries > 0 {
+				nr.Status = StatusRetried
+			} else {
+				nr.Status = StatusSuccess
+			}
+			return
 		}
-		return nr
-	}
 
-	// All attempts exhausted — try fallback.
-	if n.FallbackFn != nil {
-		if fallbackErr := n.FallbackFn(ctx, dctx); fallbackErr == nil {
-			logger.Info("node fallback succeeded", "node", n.Name)
-			nr.Status = StatusSuccess
-			nr.Error = nil
-			return nr
+		// All attempts exhausted — try fallback.
+		if n.FallbackFn != nil {
+			if fallbackErr := n.FallbackFn(ctx, dctx); fallbackErr == nil {
+				logger.Info("node fallback succeeded", "node", n.Name)
+				nr.Status = StatusSuccess
+				nr.Error = nil
+				return
+			}
+			logger.Warn("node fallback also failed", "node", n.Name)
 		}
-		logger.Warn("node fallback also failed", "node", n.Name)
-	}
 
-	nr.Status = StatusFailed
-	nr.Error = err
-	return nr
+		nr.Status = StatusFailed
+		nr.Error = err
+	}()
+
+	return retNR
 }
 
 // executeWithRetries runs the node function up to 1 + RetryCount times.

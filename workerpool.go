@@ -17,8 +17,7 @@ type execTask struct {
 //
 // readyCh is unbuffered: sends block until a worker is ready to receive.
 // The event loop uses a select on readyCh send to dispatch tasks only when
-// a worker is idle, avoiding buffer accumulation that could cause deadlock
-// when all workers are blocked in subflow event loops.
+// a worker is idle, avoiding buffer accumulation.
 type workerPool struct {
 	readyCh chan *execTask
 	wg      sync.WaitGroup
@@ -43,7 +42,11 @@ func (wp *workerPool) start() {
 func (wp *workerPool) worker() {
 	defer wp.wg.Done()
 	for t := range wp.readyCh {
-		t.doneCh <- t.exec(t.node)
+		// exec returns nil when the node is an async subflow — the result
+		// will be sent to doneCh later by a background goroutine.
+		if nr := t.exec(t.node); nr != nil {
+			t.doneCh <- nr
+		}
 	}
 }
 

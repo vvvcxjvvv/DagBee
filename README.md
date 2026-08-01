@@ -17,7 +17,7 @@ A lightweight, production-ready DAG (Directed Acyclic Graph) execution framework
 - **Logger interface** — plug in zap, logrus, or any structured logger
 - **YAML configuration** — declare topology and node settings in YAML; register functions in Go
 - **Conditional execution** — skip nodes based on runtime predicates
-- **Subflow** — dynamically generate and execute child DAGs at runtime with shared DAGContext, shared worker pool, and work-stealing deadlock prevention- **Visualization** — text-based topological layer output for debugging
+- **Subflow** — dynamically generate and execute child DAGs at runtime with shared DAGContext, shared worker pool, and async dispatch (no worker blocking)- **Visualization** — text-based topological layer output for debugging
 - **Object pooling** — `sync.Pool` reuse of DagResult / NodeResult to reduce GC pressure
 - **Near-zero framework overhead** — ~7μs to build a 20-node DAG, ~1.3μs scheduling per node, ~360B memory per node
 
@@ -216,9 +216,9 @@ dagbee/
 ├── node.go             Node type, NodeFunc signature, NodeOption
 │
 │── Engine ───────────────────────────────────────────
-├── engine.go           Execution engine: scheduling, retry, fallback
+├── engine.go           Execution engine: executeDAG event loop, async subflow, retry/fallback
 ├── scheduler.go        Priority-based ready-queue (container/heap)
-├── workerpool.go       Fixed-size worker pool (replaces per-node goroutine)
+├── workerpool.go       Fixed-size worker pool (shared, nil-skip for async subflow)
 │
 │── Data ─────────────────────────────────────────────
 ├── dagcontext.go            DAGContext: sharded key-value store with per-shard RWMutex
@@ -252,6 +252,7 @@ dagbee/
 │   ├── design-prompt.md
 │   ├── issuesAndStrategy.md
 │   ├── subflow-design.md
+│   ├── subflow-async-optimization.md
 │   └── dag-frameworks-research.md
 │
 ├── go.mod

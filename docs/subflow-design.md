@@ -4,6 +4,13 @@
 
 ---
 
+> **架构更新 (2026-08)**：Subflow 调度已从同步阻塞模型重构为异步 Join 模型。
+> Worker 不再阻塞等待子图完成，改为后台 goroutine 异步执行 + doneCh 回填结果。
+> stealCh work-stealing 机制已删除。详见下方 [异步调度重构](#异步调度重构) 小节
+> 及 `docs/issuesAndStrategy.md` #4。
+
+---
+
 ## 目标
 
 允许节点在执行时动态生成子 DAG，递归嵌入当前执行树，共享 DAGContext 和 worker pool，子图结果嵌套在父节点结果中。
@@ -96,24 +103,70 @@ Run
 
 #### 2.2 Work-stealing 解决死锁
 
-**问题**：subflow 节点同步阻塞在 `executeDAG` 的 event loop 中，占用 worker slot。若所有 worker 都在等 subflow 完成，子 DAG 的 `launchReady` 向 `wp.readyCh` 投递全部失败（走 `default`），子节点永远排队，**死锁**。
+##### 问题本质：共享无缓冲 channel 上的循环等待
+
+Subflow 节点同步阻塞在 `executeDAG` 的 event loop 中。当所有 pool worker 都在等 subflow 完成时，子 DAG 的子节点无人执行，形成死锁。
+
+关键在于 worker pool 的 `readyCh` 是**无缓冲 channel**：
+
+- **生产端**：subflow 的 event loop 通过 `select { case readySendCh <- nextTask: ... }` 向 `readyCh` 投递子节点任务。无缓冲意味着 send 成功**当且仅当**有 goroutine 正在 `receive`
+- **消费端**：pool worker 通过 `for t := range wp.readyCh` 接收任务。但所有 worker 都阻塞在各自的 subflow event loop 中，没有人在 `range wp.readyCh` 上等待
+
+结果：send 端和 receive 端都被占用的 event loop 阻塞，channel 两端无人匹配，`doneCh` 永远没有结果，**循环等待 → 死锁**。
+
+##### 死锁场景图解
+
+以 `maxConcurrency=2` 为例，父 DAG 有两个并发的 subflow 节点：
 
 ```
-maxConcurrency=2:
-  worker1 → executeDAG(subA) → 等 subA 的 doneCh
-  worker2 → executeDAG(subB) → 等 subB 的 doneCh
-  subA/subB 的 launchReady → wp.readyCh send 失败 → 子节点排队 → 永久 hang
+┌─────────────────────────────────────────────────────────────────┐
+│                      Worker Pool (2 workers)                     │
+│                                                                  │
+│  ┌──────────────────────┐    ┌──────────────────────┐           │
+│  │     Worker 0         │    │     Worker 1         │           │
+│  │  (阻塞在 subA 的     │    │  (阻塞在 subB 的     │           │
+│  │   event loop 中)     │    │   event loop 中)     │           │
+│  │                      │    │                      │           │
+│  │  select {            │    │  select {            │           │
+│  │   case doneCh_A <-   │    │   case doneCh_B <-   │           │
+│  │   case readyCh <- t  │    │   case readyCh <- t  │  ← send   │
+│  │   case dagCtx.Done   │    │   case dagCtx.Done   │    端     │
+│  │  }                   │    │  }                   │           │
+│  └──────────────────────┘    └──────────────────────┘           │
+│           │                           │                          │
+│           │  subA 想投递子节点任务     │  subB 想投递子节点任务   │
+│           │  case readyCh <- task     │  case readyCh <- task   │
+│           ▼                           ▼                          │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │              wp.readyCh (无缓冲)                   │           │
+│  │  send 端：subA/subB 的 event loop                 │           │
+│  │  receive 端：??? 无人接收（worker 都在 event loop）│  ← 死锁   │
+│  └──────────────────────────────────────────────────┘           │
+│                                                                  │
+│  正常的 worker: for t := range wp.readyCh { ... }               │
+│  ↑ 这两个 worker 不在这里，它们在各自的 event loop 中            │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**修复**：event loop 等待 `doneCh` 时主动消费 `wp.readyCh`，帮忙执行任意层的就绪任务。这是 Taskflow `corun` 的本质——等待者主动参与执行。
+##### 修复方案：event loop 的 steal case
+
+在 event loop 的 `select` 中增加一个 receive 分支，让等待 `doneCh` 的 event loop 同时能从 `readyCh` 接收任务：
 
 ```go
+var stealCh chan *execTask
+if depth > 0 {
+    stealCh = wp.readyCh  // subflow 层启用 work-stealing
+}
+// depth = 0 时 stealCh = nil，select 中此 case 永不触发
+
 for completed < total {
     select {
+    case readySendCh <- nextTask:
+        // 投递自己的子节点任务给空闲 worker（send 端）
     case nr := <-doneCh:
-        // 处理结果、传播依赖、launchReady
-    case task := <-wp.readyCh:
-        // work-stealing: 帮忙执行任意层的就绪任务
+        // 接收子节点完成结果
+    case task := <-stealCh:
+        // 窃取并执行任意层的就绪任务（receive 端）
         task.doneCh <- task.exec(task.node)
     case <-dagCtx.Done():
         // 超时/取消
@@ -121,14 +174,108 @@ for completed < total {
 }
 ```
 
-效果：
+同一个 `wp.readyCh`，event loop 既是 **send 端**（投递自己的任务）又是 **receive 端**（帮别人执行任务）。两个 subflow 的 event loop 互为生产者和消费者，匹配成功。
 
-- worker1 阻塞在 subA 的 event loop，select 中消费 `wp.readyCh`，执行 subB 的子节点
-- worker2 阻塞在 subB 的 event loop，同理消费 subA 的子节点
-- 子节点被推进，doneCh 有结果，event loop 解除阻塞
-- 零死锁，不引入新 goroutine，不需要异步状态机
+##### 修复后图解
 
-**额外收益**：work-stealing 提升资源利用率。普通场景中，event loop 等待 doneCh 的空闲时间可用于执行其他就绪节点，减少 worker 空转。
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Worker Pool (2 workers)                     │
+│                                                                  │
+│  ┌──────────────────────┐    ┌──────────────────────┐           │
+│  │     Worker 0         │    │     Worker 1         │           │
+│  │  (subA event loop)   │    │  (subB event loop)   │           │
+│  │                      │    │                      │           │
+│  │  select {            │    │  select {            │           │
+│  │   case readyCh <- t  │───►│   case readyCh <- t  │───┐      │
+│  │   case doneCh_A <-   │    │   case doneCh_B <-   │   │      │
+│  │   case stealCh <- t  │◄───│   case stealCh <- t  │◄──┘      │
+│  │  }                   │    │  }                   │           │
+│  └──────────────────────┘    └──────────────────────┘           │
+│                                                                  │
+│  stealCh = wp.readyCh (depth > 0 时)                            │
+│                                                                  │
+│  subA send 子节点 → readyCh → subB 的 stealCh receive 并执行     │
+│  subB send 子节点 → readyCh → subA 的 stealCh receive 并执行     │
+│                                                                  │
+│  两个 event loop 互为生产者和消费者，交替推进                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+##### 分步推演
+
+`maxConcurrency=2`，subA 有子节点 A1、A2，subB 有子节点 B1、B2：
+
+```
+Step 1: 初始状态
+  worker0 → executeDAG(subA) → 子节点 A1 就绪 → dispatchReady 生成 taskA1
+  worker1 → executeDAG(subB) → 子节点 B1 就绪 → dispatchReady 生成 taskB1
+
+  worker0 的 select: 尝试 send taskA1 到 readyCh
+  worker1 的 select: 尝试 send taskB1 到 readyCh
+
+  ┌─────────────────────────────────────────────────────┐
+  │  readyCh (无缓冲)                                   │
+  │  worker0: case readyCh <- taskA1  (send, 等接收者)  │
+  │  worker1: case readyCh <- taskB1  (send, 等接收者)  │
+  │  receive 端: worker0/1 的 stealCh = readyCh         │
+  └─────────────────────────────────────────────────────┘
+
+Step 2: 匹配成功
+  Go select 随机选择一个就绪 case。
+  假设 worker0 的 send 和 worker1 的 stealCh 匹配：
+
+  worker1: case task := <-stealCh 命中 → 接收到 taskA1
+           → taskA1.exec(nodeA1) 同步执行 A1
+           → taskA1.doneCh <- resultA1  结果发回 subA 的 doneCh
+
+  worker0: case readySendCh <- taskA1 命中 → send 成功
+           → commitDispatch() A1 标记 started
+           → dispatchReady 生成 taskA2
+
+Step 3: 结果回流
+  subA 的 doneCh 收到 resultA1
+  worker0 的 select: case nr := <-doneCh 命中
+    → completed++
+    → 传播依赖（如果 A2 依赖 A1，A2 的 pending 归零入队）
+    → dispatchReady 准备投递 taskA2
+
+Step 4: 交替推进
+  worker0 尝试 send taskA2
+  worker1 执行完 A1 后回到 select，stealCh 可接收
+  → worker1 再次 steal，执行 A2
+
+  同时 worker1 也在尝试 send taskB1
+  worker0 的 stealCh 可接收
+  → worker0 steal，执行 B1
+
+  两个 subflow 的子节点被交替执行：
+    A1 (by worker1) → B1 (by worker0) → A2 (by worker1) → B2 (by worker0)
+    或者其他交错顺序，取决于 Go select 的随机调度
+
+Step 5: 全部完成
+  subA: A1 ✓, A2 ✓ → doneCh 全部处理 → completed == total → 循环结束
+  subB: B1 ✓, B2 ✓ → doneCh 全部处理 → completed == total → 循环结束
+  两个 event loop 退出 → worker0、worker1 释放回 pool
+```
+
+##### 为什么只在 depth > 0 启用
+
+depth = 0 时 event loop 跑在 `Run` 的 goroutine 上，不是 pool worker。如果它 steal 并执行任务，总并发 = `maxConcurrency`（pool workers）+ 1（Run goroutine），超出限制。
+
+depth > 0 时 event loop 跑在某个 pool worker 上。这个 worker 当前处于"等待"状态（阻塞在 select），没有执行节点。它通过 steal case 执行一个任务，只是从"等待"切换到"执行"，占用自己的 worker slot。总并发不变。
+
+```go
+var stealCh chan *execTask
+if depth > 0 {
+    stealCh = wp.readyCh  // subflow: 启用
+}
+// depth = 0: stealCh = nil → select 中此 case 永不触发（nil channel 永久阻塞）
+```
+
+##### 额外收益
+
+work-stealing 不仅防死锁，还提升资源利用率。即使没有 subflow 死锁场景，event loop 等待 `doneCh` 时的空闲时间也可用于执行其他就绪节点，减少 worker 空转。
 
 #### 2.3 execTask 结构
 
@@ -398,35 +545,14 @@ if d.timeout > 0 {
 
 ### 死锁场景详解
 
-以 `maxConcurrency=2` 为例，两个 subflow 节点并发执行：
+详细图解和分步推演见上方 [2.2 Work-stealing 解决死锁](#22-work-stealing-解决死锁) 小节。
 
-```
-初始: worker1 空闲, worker2 空闲
-launchReady → wp.readyCh <- subA_task, wp.readyCh <- subB_task
+核心结论：
 
-worker1 取到 subA_task → executeNode(subA) → SubflowFn 生成 subDAG_A
-  → executeDAG(subDAG_A, depth=1)
-    → launchReady → wp.readyCh <- subA_child1_task
-    → event loop: select { doneCh | wp.readyCh | dagCtx.Done() }
-
-worker2 取到 subB_task → executeNode(subB) → SubflowFn 生成 subDAG_B
-  → executeDAG(subDAG_B, depth=1)
-    → launchReady → wp.readyCh <- subB_child1_task
-    → event loop: select { doneCh | wp.readyCh | dagCtx.Done() }
-
-此时 worker1、worker2 都在各自 event loop 的 select 中等待。
-
-无 work-stealing: subA_child1_task 和 subB_child1_task 在 wp.readyCh 中
-  → 没有 worker 消费 readyCh（都在 event loop 等 doneCh）
-  → doneCh 永远没结果 → 死锁
-
-有 work-stealing: worker1 的 event loop select 命中 case task := <-wp.readyCh
-  → 执行 subB_child1_task → 结果送 subB 的 doneCh
-  → worker2 的 event loop 命中 case nr := <-doneCh → 推进 subB 调度
-  → worker2 的 event loop select 命中 case task := <-wp.readyCh
-  → 执行 subA_child1_task → 结果送 subA 的 doneCh
-  → 两个子 DAG 交替推进 → 全部完成 → event loop 退出 → worker 释放
-```
+1. **死锁根因**：无缓冲 `readyCh` 需要 send 端和 receive 端同时就绪。所有 worker 阻塞在 subflow event loop 中时，没有 goroutine 在 `range readyCh` 上等待，send 永远失败
+2. **修复原理**：event loop 的 `stealCh = readyCh`（depth > 0 时），让等待 `doneCh` 的 event loop 同时充当 `readyCh` 的消费者，两个 subflow 互为生产者和消费者
+3. **并发安全**：steal 的 goroutine 是 pool worker，当前处于"等待"状态，执行任务只是切换到"执行"状态，总并发不超限
+4. **验证测试**：`TestSubflow_DeadlockAvoidance` 用 `maxConcurrency=2` + 双 subflow 验证不死锁，30 次连续运行零失败
 
 ---
 
@@ -495,3 +621,140 @@ for name, nr := range subResult.Results {
 6. **engine.go** — 提取 `executeDAG`，event loop 加 work-stealing，`executeNode` 加 subflow 分支
 7. **测试** — subflow 基本、嵌套、深度限制、panic 恢复、并发度验证、死锁验证（maxConcurrency=2 + 双 subflow）
 8. **文档更新** — README、doc.go、design-prompt.md、issuesAnStrategy.md
+
+
+---
+
+## 异步调度重构
+
+### 改造前：同步阻塞 + stealCh
+
+Worker 拿到 subflow 节点后同步调用 `executeDAG`，整个子图跑完才释放。通过
+`stealCh = wp.readyCh`（depth > 0 时）被动窃取任务防死锁。
+
+```
+Worker ──► executeNode(subflow)
+         └─► SubflowFn() 构图
+            └─► executeDAG(childDAG) [阻塞，worker 不释放]
+                 ├─ event loop: select {
+                 │    case readyCh <- task   // 投递子节点
+                 │    case doneCh <- nr      // 接收子节点完成
+                 │    case stealCh <- task   // 窃取其他层任务执行
+                 │    case ctx.Done()
+                 │  }
+                 └─ 子图全部完成 → 返回 subResult
+         └─► 回填 SubflowResult → 返回 NodeResult → worker 释放
+```
+
+**问题**：
+1. Worker 整个子图执行期间被占用，高并发多层 subflow 时可用 worker 急剧减少
+2. stealCh 是补丁不根治：顶层无窃取、窃取长任务拖慢自身、无任务可偷时卡死
+3. 递归 executeDAG 调用，栈深度随嵌套层级增长
+
+### 改造后：异步 Join 模型
+
+Worker 仅同步执行 SubflowFn 构图，然后启动后台 goroutine 执行子 DAG，worker
+立即释放。子图在 goroutine 中调度（不占 worker slot），完成后通过 doneCh
+通知父 DAG。
+
+```
+Worker ──► executeNode(subflow)
+         ├─► SubflowFn() 构图 [同步, 带 panic recovery]
+         ├─► go func() {                    [异步, worker 立即释放]
+         │      executeDAG(childDAG)
+         │      → 子节点通过 wp.readyCh 由空闲 worker 执行
+         │      → 子图全部完成 → doneCh <- NodeResult
+         │  }()
+         └─► return nil  [worker 跳过 doneCh 发送, 回到 readyCh]
+```
+
+**Event loop 简化**（3 路 select，删除 stealCh）：
+
+```go
+for completed < total {
+    select {
+    case readySendCh <- nextTask:  // dispatch ready node to worker
+    case nr := <-doneCh:           // process completion (incl. async subflow)
+    case <-ctxDone:                // timeout/cancellation
+    }
+}
+```
+
+### 关键设计决策
+
+**1. executeNode 返回 nil 表示异步**
+
+```go
+func (e *Engine) executeNode(..., doneCh chan<- *NodeResult) *NodeResult
+```
+
+- 普通节点：返回完整 NodeResult，worker 发送到 doneCh
+- Subflow 节点：返回 nil，worker 跳过发送（goroutine 稍后发送）
+
+Worker 适配：
+
+```go
+for t := range wp.readyCh {
+    if nr := t.exec(t.node); nr != nil {
+        t.doneCh <- nr
+    }
+}
+```
+
+**2. 命名返回值陷阱**
+
+原始实现使用命名返回值 `(nr *NodeResult)`，subflow 分支 `return nil` 会将 `nr`
+设为 nil。Goroutine 闭包捕获 `nr` 变量，此时为 nil 指针 → 运行时 panic。
+
+修复：改用 `*NodeResult` 返回类型（非命名），subflow 分支用 `result := nr`
+局部拷贝传给 goroutine 闭包。
+
+**3. dagCtx.Done() 忙等待修复**
+
+原实现在 `case <-dagCtx.Done()` 触发后不 nil 化 channel 变量，后续循环中
+`Done()` 始终就绪导致 select 忙等待。改为首次触发后 `ctxDone = nil`，利用
+nil-channel 永久阻塞特性禁用该 case。
+
+### 死锁分析：为什么异步模型不需要 stealCh
+
+**同步模型死锁根因**：无缓冲 `readyCh` 需要 send 端和 receive 端同时就绪。
+所有 worker 阻塞在 subflow event loop 中时，没有 goroutine 在 `range readyCh`
+上等待，send 永远失败 → 循环等待 → 死锁。
+
+**异步模型为什么不会死锁**：
+
+1. Worker 执行完 SubflowFn 后立即返回 nil，回到 `range readyCh`
+2. 子图 goroutine 通过 `readySendCh <- nextTask` 投递子节点
+3. 空闲 worker 从 `range readyCh` 接收并执行子节点
+4. 子节点完成发往子图的 `doneCh`，子图 goroutine 处理结果
+
+```
+maxConcurrency=1 场景：
+  Worker 执行 SubflowFn → return nil → 回到 range readyCh
+  子图 goroutine → readySendCh <- childTask → Worker 接收执行
+  Worker 执行完 childTask → doneCh <- result → 回到 range readyCh
+  子图 goroutine ← doneCh ← 处理 result → 投递下一个 childTask
+  ...
+  子图全部完成 → doneCh <- parentResult → 父 DAG 继续
+```
+
+Worker 在 SubflowFn 执行和子节点执行之间自由切换，不会被任何单个 DAG 层阻塞。
+
+### 性能对比
+
+| 维度 | 同步 + stealCh | 异步 Join |
+|------|---------------|-----------|
+| worker 占用 | 整个子图期间 | 仅 SubflowFn |
+| select 分支 | 4 路 | 3 路 |
+| 递归栈深度 | O(depth) | O(1)（goroutine 独立栈） |
+| goroutine 数 | N workers | N workers + M active subflows |
+| maxConcurrency=1 可用性 | 会死锁（1 worker 被 subflow 阻塞，无 worker 执行子节点，stealCh 也不能用因为 depth=0） | 正常工作（worker 释放后执行子节点） |
+
+### 测试验证
+
+| 测试 | 场景 |
+|------|------|
+| `TestSubflow_AsyncMaxConcurrency1` | maxConcurrency=1，subflow + sibling 并发 |
+| `TestSubflow_DeepNesting` | 5 层嵌套不栈溢出 |
+| `TestSubflow_DeadlockAvoidance` | maxConcurrency=2，双 subflow 并发 |
+| `-race -count=5` | 56 测试 × 5 轮零竞争 |

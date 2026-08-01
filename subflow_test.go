@@ -359,3 +359,111 @@ func TestSubflow_ConcurrencyRespected(t *testing.T) {
 		t.Fatalf("expected max ~2-3 concurrent, got %d", maxRunning)
 	}
 }
+
+func TestSubflow_AsyncMaxConcurrency1(t *testing.T) {
+	// maxConcurrency=1: a single worker. A subflow node with a slow child
+	// and a sibling node, both with zero in-degree.
+	//
+	// In the async model, the worker runs SubflowFn, launches the child DAG
+	// goroutine, then returns nil. The worker is immediately free to pick
+	// up the sibling node. Both the sibling and the child node compete for
+	// the single worker slot via wp.readyCh, and both complete.
+	//
+	// Total wall time ~ child duration (50ms) since sibling is near-instant
+	// and runs between child dispatch rounds.
+	d := NewDAG("async-test", WithMaxConcurrency(1))
+
+	d.AddNode("sub", nil,
+		NodeWithSubflow(func(ctx context.Context, dctx *DAGContext) (*DAG, error) {
+			sub := NewDAG("child")
+			sub.AddNode("c1", func(ctx context.Context, dctx *DAGContext) error {
+				time.Sleep(50 * time.Millisecond)
+				dctx.Set("child_done", true)
+				return nil
+			})
+			return sub, nil
+		}),
+	)
+
+	d.AddNode("sibling", func(_ context.Context, dctx *DAGContext) error {
+		dctx.Set("sibling_done", true)
+		return nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	result := NewEngine().Run(ctx, d)
+	elapsed := time.Since(start)
+
+	if result.Status != StatusSuccess {
+		t.Fatalf("expected success, got %s: %v", result.Status, result.Error)
+	}
+
+	// Both nodes must have completed.
+	if result.NodeResult("sibling") == nil {
+		t.Fatal("sibling node never ran")
+	}
+	if result.NodeResult("sub") == nil || result.NodeResult("sub").SubflowResult == nil {
+		t.Fatal("subflow never completed")
+	}
+
+	// With async dispatch, total time should be ~50ms (child duration),
+	// not 100ms+ (child + sibling serial). Allow generous margin.
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("expected ~50ms, got %v — worker may be blocked", elapsed)
+	}
+}
+
+func TestSubflow_DeepNesting(t *testing.T) {
+	// 5 levels of nesting — verifies goroutine-based async execution
+	// doesn't stack-overflow and correctly propagates results.
+	const depth = 5
+	d := NewDAG("root")
+	d.AddNode("n0", nil,
+		NodeWithSubflow(func(ctx context.Context, dctx *DAGContext) (*DAG, error) {
+			return buildNestedSubflow(depth, 1, dctx), nil
+		}),
+	)
+
+	eng := NewEngine(EngineWithMaxSubflowDepth(depth + 1))
+	result := eng.Run(context.Background(), d)
+	if result.Status != StatusSuccess {
+		t.Fatalf("expected success, got %s: %v", result.Status, result.Error)
+	}
+
+	// Walk the nesting chain: n0 -> n1 -> n2 -> ... -> n{depth}
+	sub := result.NodeResult("n0").SubflowResult
+	for i := 1; i <= depth; i++ {
+		if sub == nil {
+			t.Fatalf("missing subflow at depth %d", i)
+		}
+		name := fmt.Sprintf("n%d", i)
+		nr := sub.NodeResult(name)
+		if nr == nil {
+			t.Fatalf("missing node %s at depth %d", name, i)
+		}
+		if i < depth {
+			sub = nr.SubflowResult
+		}
+	}
+}
+
+func buildNestedSubflow(targetDepth, currentDepth int, dctx *DAGContext) *DAG {
+	name := fmt.Sprintf("n%d", currentDepth)
+	sub := NewDAG(fmt.Sprintf("level%d", currentDepth))
+	if currentDepth >= targetDepth {
+		sub.AddNode(name, func(_ context.Context, dctx *DAGContext) error {
+			dctx.Set(fmt.Sprintf("deep_%d", currentDepth), true)
+			return nil
+		})
+		return sub
+	}
+	sub.AddNode(name, nil,
+		NodeWithSubflow(func(ctx context.Context, dctx *DAGContext) (*DAG, error) {
+			return buildNestedSubflow(targetDepth, currentDepth+1, dctx), nil
+		}),
+	)
+	return sub
+}
