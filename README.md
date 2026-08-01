@@ -243,12 +243,15 @@ dagbee/
 ├── examples/
 │   ├── simple/         Minimal 3-node example
 │   ├── mapreduce/      Word-count MapReduce pipeline (split→map→shuffle→reduce→merge)
+│   ├── subflow/        Dynamic subflow: runtime child DAG with shared context & worker pool
 │   └── recommend/      Recommendation pipeline with YAML config
 │       ├── main.go     Multi-channel recall → merge → fill_detail → filter
 │       │               → CTR/CVR scoring → eCPM fusion → rerank
 │       └── pipeline.yaml
 ├── docs/
 │   ├── design-prompt.md
+│   ├── issuesAndStrategy.md
+│   ├── subflow-design.md
 │   └── dag-frameworks-research.md
 │
 ├── go.mod
