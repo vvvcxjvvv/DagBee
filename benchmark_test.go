@@ -74,3 +74,23 @@ func BenchmarkDAGContext_ConcurrentRW(b *testing.B) {
 		wg.Wait()
 	}
 }
+
+// BenchmarkDAGContext_DistinctKeyContention simulates fan-out: many goroutines
+// writing distinct keys concurrently. With sharded locks, these should proceed
+// in parallel; the old single-lock design serialized all writers.
+func BenchmarkDAGContext_DistinctKeyContention(b *testing.B) {
+	for _, writers := range []int{8, 32, 128} {
+		b.Run(fmt.Sprintf("writers=%d", writers), func(b *testing.B) {
+			dctx := NewDAGContext()
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				i := 0
+				for pb.Next() {
+					dctx.Set(fmt.Sprintf("key_%d", i%writers), i)
+					i++
+				}
+			})
+		})
+	}
+}

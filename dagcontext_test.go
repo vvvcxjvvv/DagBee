@@ -1,6 +1,8 @@
 package dagbee
 
 import (
+	"context"
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -139,4 +141,74 @@ func TestDAGContext_ConcurrentReadWrite(t *testing.T) {
 	if s.Len() != 1 {
 		t.Fatalf("expected 1 key, got %d", s.Len())
 	}
+}
+
+func TestNewDAGContextWithShards(t *testing.T) {
+	dctx := newDAGContextWithShards(1)
+	if len(dctx.shards) != 1 {
+		t.Fatalf("expected 1 shard, got %d", len(dctx.shards))
+	}
+
+	dctx = newDAGContextWithShards(64)
+	if len(dctx.shards) != 64 {
+		t.Fatalf("expected 64 shards, got %d", len(dctx.shards))
+	}
+
+	// non-power-of-two
+	dctx = newDAGContextWithShards(7)
+	if len(dctx.shards) != 7 {
+		t.Fatalf("expected 7 shards, got %d", len(dctx.shards))
+	}
+
+	// clamped to 1
+	dctx = newDAGContextWithShards(0)
+	if len(dctx.shards) != 1 {
+		t.Fatalf("expected 1 shard for n=0, got %d", len(dctx.shards))
+	}
+}
+
+func TestDAGContext_NonPow2ShardDistribution(t *testing.T) {
+	dctx := newDAGContextWithShards(7)
+	// Write 100 keys, verify they distribute across shards (not all in one).
+	for i := 0; i < 100; i++ {
+		dctx.Set(fmt.Sprintf("key_%d", i), i)
+	}
+	used := 0
+	for _, s := range dctx.shards {
+		s.mu.RLock()
+		if len(s.data) > 0 {
+			used++
+		}
+		s.mu.RUnlock()
+	}
+	if used < 3 {
+		t.Fatalf("expected keys spread across >= 3 shards, got %d", used)
+	}
+}
+
+func TestEngineWithDAGContextShards(t *testing.T) {
+	eng := NewEngine(EngineWithDAGContextShards(1))
+	if eng.dctxShards != 1 {
+		t.Fatalf("expected dctxShards=1, got %d", eng.dctxShards)
+	}
+
+	// n < 1 is ignored
+	eng = NewEngine(EngineWithDAGContextShards(0))
+	if eng.dctxShards != 0 {
+		t.Fatalf("expected dctxShards=0, got %d", eng.dctxShards)
+	}
+
+	// Verify engine uses configured shard count
+	eng = NewEngine(EngineWithDAGContextShards(1))
+	d := NewDAG("test")
+	d.AddNode("A", func(_ context.Context, dctx *DAGContext) error {
+		// With 1 shard, all keys go to the same shard
+		dctx.Set("a", 1)
+		return nil
+	})
+	result := eng.Run(context.Background(), d)
+	if result.Status != StatusSuccess {
+		t.Fatalf("expected success, got %s", result.Status)
+	}
+	ReleaseDagResult(result)
 }

@@ -16,7 +16,7 @@
 //	  scheduler.go    Priority-based ready-queue (container/heap), SchedulerStrategy interface
 //
 //	Data ─ Runtime data and results
-//	  dagcontext.go    DAGContext: concurrency-safe key-value store for inter-node data passing
+//	  dagcontext.go    DAGContext: sharded concurrency-safe key-value store for inter-node data passing
 //	  result.go       NodeResult / DagResult definitions, sync.Pool object reuse
 //
 //	Support ─ Cross-cutting concerns

@@ -33,3 +33,16 @@ type EngineOption func(*Engine)
 func EngineWithLogger(l Logger) EngineOption {
 	return func(e *Engine) { e.logger = l }
 }
+
+// EngineWithDAGContextShards sets the number of shards (independent lock
+// partitions) for the DAGContext created by the engine. A value of 0 (the
+// default) uses runtime.NumCPU()*4 rounded up to a power of two. Values less
+// than 1 are ignored. Non-power-of-two values are supported but slightly
+// slower (modulo vs. bitmask).
+func EngineWithDAGContextShards(n int) EngineOption {
+	return func(e *Engine) {
+		if n >= 1 {
+			e.dctxShards = n
+		}
+	}
+}

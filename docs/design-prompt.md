@@ -49,7 +49,7 @@
 
 - 框架层提供线程安全的 **DAGContext（DAG 上下文）**：
   - key-value 存取，支持泛型辅助函数或类型断言辅助函数；
-  - 读写并发安全（细粒度锁或 `sync.Map`）；
+  - 读写并发安全（分片 RWMutex，按 key hash 分布到独立 shard）；
   - 贯穿整个 DAG 执行生命周期；
 - 业务层允许用户自定义强类型的结构体作为节点间传递的数据载体；
 - DAGContext 在 DAG 执行前初始化，执行后可整体读取。
@@ -223,7 +223,7 @@ dagbee/
 
 - 完整的 Go 文档注释（`/* */` 或 `//`）；
 - 变量、函数命名清晰，符合 Go 语言规范；
-- 并发安全（用 `sync.Mutex`、`sync.RWMutex`、`sync.Map` 等保证共享数据安全）；
+- 并发安全（用 `sync.RWMutex` 分片锁保证共享数据安全）；
 - 采用 **Builder 模式 + Functional Options** 构建 DAG，兼顾可读性和扩展性。
 
 #### 3. 测试要求

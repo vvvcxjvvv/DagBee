@@ -12,7 +12,7 @@ A lightweight, production-ready DAG (Directed Acyclic Graph) execution framework
 - **Fallback functions** — provide default data when a node fails
 - **Panic recovery** — a panicking node never crashes the process
 - **Graceful shutdown** — context cancellation stops scheduling and waits for running nodes
-- **DAGContext** — concurrency-safe key-value store for passing data between nodes, with generics support
+- **DAGContext** — concurrency-safe sharded key-value store for passing data between nodes, with generics support
 - **Lifecycle hooks** — BeforeNode / AfterNode / OnNodeSkip / OnDAGComplete
 - **Logger interface** — plug in zap, logrus, or any structured logger
 - **YAML configuration** — declare topology and node settings in YAML; register functions in Go
@@ -185,7 +185,7 @@ go test -bench=. -benchmem ./...  # benchmarks
 
 ```bash
 go test -run '^$' -bench 'BenchmarkEngineRun_(WideDAG|DeepDAG|FanOutFanIn|RetryAmplification|ParallelRequests)$' -benchmem ./...
-go test -run '^$' -bench 'BenchmarkDAGContext_HotKeyContention$' -benchmem ./...
+go test -run '^$' -bench 'BenchmarkDAGContext_(HotKeyContention|DistinctKeyContention)$' -benchmem ./...
 go test -run '^$' -bench 'BenchmarkEngineRun_ParallelRequests$' -benchmem -cpuprofile cpu.out -memprofile mem.out ./...
 ```
 
@@ -197,6 +197,7 @@ Scenarios included:
 - `BenchmarkEngineRun_RetryAmplification`: retry-driven load amplification
 - `BenchmarkEngineRun_ParallelRequests`: many concurrent requests, each running one DAG
 - `BenchmarkDAGContext_HotKeyContention`: `DAGContext` hot-key lock contention
+- `BenchmarkDAGContext_DistinctKeyContention`: `DAGContext` distinct-key fan-out write parallelism (sharded lock validation)
 
 ## Project Structure
 
@@ -212,7 +213,7 @@ dagbee/
 ├── scheduler.go        Priority-based ready-queue (container/heap)
 │
 │── Data ─────────────────────────────────────────────
-├── dagcontext.go            DAGContext: concurrent key-value store
+├── dagcontext.go            DAGContext: sharded key-value store with per-shard RWMutex
 ├── result.go           NodeResult / DagResult + sync.Pool
 │
 │── Support ──────────────────────────────────────────

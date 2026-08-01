@@ -12,7 +12,8 @@ import (
 // Engine orchestrates the execution of a DAG: validation, topological
 // scheduling, concurrency control, retry/fallback, and result collection.
 type Engine struct {
-	logger Logger
+	dctxShards int
+	logger     Logger
 }
 
 // NewEngine creates an Engine with the given options.
@@ -47,7 +48,13 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 	}
 	defer dagCancel()
 
-	dctx := NewDAGContext()
+	var dctx *DAGContext
+	n := e.dctxShards
+	if n > 0 {
+		dctx = newDAGContextWithShards(n)
+	} else {
+		dctx = NewDAGContext()
+	}
 
 	logger := d.logger
 	if _, ok := logger.(noopLogger); ok {
