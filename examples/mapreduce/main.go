@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"dagbee"
+	"github.com/vvvcxjvvv/DagBee"
 )
 
 // MapReduce pipeline:

@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"dagbee"
+	"github.com/vvvcxjvvv/DagBee"
 )
 
 func main() {

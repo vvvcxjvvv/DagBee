@@ -1,4 +1,4 @@
-module dagbee
+module github.com/vvvcxjvvv/DagBee
 
 go 1.19
 
