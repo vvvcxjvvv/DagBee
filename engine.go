@@ -34,12 +34,14 @@ func NewEngine(opts ...EngineOption) *Engine {
 // Run executes the DAG and returns the aggregated result.
 // The context controls the overall lifetime; cancelling it triggers graceful shutdown.
 func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
-	result := AcquireDagResult()
-	result.DagName = d.name
-	result.StartTime = time.Now()
+	startTime := time.Now()
 
 	// --- Validate ---
 	if err := d.Validate(); err != nil {
+		result := AcquireDagResult()
+		result.DagName = d.name
+		result.StartTime = startTime
+		result.dag = d
 		result.Status = StatusFailed
 		result.Error = err
 		result.EndTime = time.Now()
@@ -69,7 +71,7 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 	wp := newWorkerPool(maxConc)
 	wp.start()
 
-	result = e.executeDAG(ctx, d, dctx, wp, nil, 0, logger)
+	result := e.executeDAG(ctx, d, dctx, wp, nil, 0, logger)
 
 	wp.stop()
 	wp.wait()
@@ -105,6 +107,7 @@ func (e *Engine) executeDAG(
 	result := AcquireDagResult()
 	result.DagName = d.name
 	result.StartTime = time.Now()
+	result.dag = d
 
 	// --- Context with optional DAG-level timeout ---
 	// context.WithTimeout automatically takes min(parent timeout, child timeout).
@@ -208,9 +211,7 @@ func (e *Engine) executeDAG(
 					if !started[name] && result.Results[name] == nil {
 						started[name] = true
 						completed++
-						skipNR := acquireNodeResult()
-						skipNR.NodeName = name
-						skipNR.Status = StatusSkipped
+						skipNR := acquireSkippedNodeResult(name, "DAG cancelled due to critical node failure")
 						result.Results[name] = skipNR
 						d.hooks.OnNodeSkip(dagCtx, name, "DAG cancelled due to critical node failure")
 					}
@@ -253,9 +254,7 @@ func (e *Engine) executeDAG(
 							// downstream pending still decrements.
 							started[downstream] = true
 							completed++
-							skipNR := acquireNodeResult()
-							skipNR.NodeName = downstream
-							skipNR.Status = StatusSkipped
+							skipNR := acquireSkippedNodeResult(downstream, "route not selected")
 							result.Results[downstream] = skipNR
 							d.hooks.OnNodeSkip(dagCtx, downstream, "route not selected")
 							// Propagate skip to the skipped node's downstream.
@@ -299,9 +298,7 @@ func (e *Engine) executeDAG(
 				if !started[name] && result.Results[name] == nil {
 					started[name] = true
 					completed++
-					skipNR := acquireNodeResult()
-					skipNR.NodeName = name
-					skipNR.Status = StatusSkipped
+					skipNR := acquireSkippedNodeResult(name, "DAG context done")
 					result.Results[name] = skipNR
 					d.hooks.OnNodeSkip(dagCtx, name, "DAG context done")
 				}
@@ -358,11 +355,16 @@ func (e *Engine) executeNode(
 	d.hooks.BeforeNode(ctx, n.Name)
 
 	// Condition gate.
-	if n.ConditionFn != nil && !n.ConditionFn(dctx) {
-		nr.Status = StatusSkipped
-		d.hooks.OnNodeSkip(ctx, n.Name, "condition not met")
-		finalize()
-		return nr
+	if n.ConditionFn != nil {
+		nr.ConditionEvaluated = true
+		nr.ConditionMatched = n.ConditionFn(dctx)
+		if !nr.ConditionMatched {
+			nr.Status = StatusSkipped
+			nr.SkipReason = "condition not met"
+			d.hooks.OnNodeSkip(ctx, n.Name, nr.SkipReason)
+			finalize()
+			return nr
+		}
 	}
 
 	// --- Subflow branch ---
@@ -565,4 +567,15 @@ func (e *Engine) retryInterval(n *Node, attempt int) time.Duration {
 	default: // RetryFixed
 		return n.RetryInterval
 	}
+}
+
+func acquireSkippedNodeResult(name, reason string) *NodeResult {
+	nr := acquireNodeResult()
+	now := time.Now()
+	nr.NodeName = name
+	nr.Status = StatusSkipped
+	nr.StartTime = now
+	nr.EndTime = now
+	nr.SkipReason = reason
+	return nr
 }

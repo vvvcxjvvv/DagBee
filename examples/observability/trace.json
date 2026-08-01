@@ -1,0 +1,120 @@
+{
+  "traceEvents": [
+    {
+      "name": "observability-demo",
+      "cat": "dag",
+      "ph": "X",
+      "ts": 1785600236234797,
+      "dur": 90573,
+      "tid": 0,
+      "pid": 0
+    },
+    {
+      "name": "check-eligibility",
+      "cat": "node",
+      "ph": "X",
+      "ts": 1785600236258574,
+      "dur": 8886,
+      "tid": 459,
+      "pid": 0,
+      "args": {
+        "condition_matched": true,
+        "status": "Success"
+      }
+    },
+    {
+      "name": "enrich-results",
+      "cat": "node",
+      "ph": "X",
+      "ts": 1785600236298721,
+      "dur": 26643,
+      "tid": 439,
+      "pid": 0,
+      "args": {
+        "status": "Success"
+      }
+    },
+    {
+      "name": "enrichment-subflow",
+      "cat": "dag",
+      "ph": "X",
+      "ts": 1785600236298895,
+      "dur": 26461,
+      "tid": 1,
+      "pid": 0
+    },
+    {
+      "name": "load-features",
+      "cat": "node",
+      "ph": "X",
+      "ts": 1785600236298920,
+      "dur": 15446,
+      "tid": 1867,
+      "pid": 0,
+      "args": {
+        "status": "Success"
+      }
+    },
+    {
+      "name": "merge-features",
+      "cat": "node",
+      "ph": "X",
+      "ts": 1785600236314389,
+      "dur": 10955,
+      "tid": 1313,
+      "pid": 0,
+      "args": {
+        "status": "Success"
+      }
+    },
+    {
+      "name": "fetch-profile",
+      "cat": "node",
+      "ph": "X",
+      "ts": 1785600236234839,
+      "dur": 22335,
+      "tid": 743,
+      "pid": 0,
+      "args": {
+        "status": "Success"
+      }
+    },
+    {
+      "name": "premium-ranking",
+      "cat": "node",
+      "ph": "X",
+      "ts": 1785600236267550,
+      "dur": 31143,
+      "tid": 21,
+      "pid": 0,
+      "args": {
+        "status": "Success"
+      }
+    },
+    {
+      "name": "select-pipeline",
+      "cat": "node",
+      "ph": "X",
+      "ts": 1785600236267539,
+      "dur": 1,
+      "tid": 966,
+      "pid": 0,
+      "args": {
+        "route_index": 0,
+        "status": "Success"
+      }
+    },
+    {
+      "name": "standard-ranking",
+      "cat": "node",
+      "ph": "i",
+      "ts": 1785600236267547,
+      "tid": 667,
+      "pid": 0,
+      "args": {
+        "skip_reason": "route not selected",
+        "status": "skipped"
+      }
+    }
+  ]
+}

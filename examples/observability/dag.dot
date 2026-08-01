@@ -1,0 +1,30 @@
+digraph "observability-demo" {
+  rankdir=LR;
+  compound=true;
+  node [fontname="Helvetica"];
+  edge [fontname="Helvetica"];
+
+  "root/check-eligibility" [label="check-eligibility\n(condition)\n[Success]\ncondition=true\n8.886958ms", shape=diamond, fillcolor="lightyellow", style=filled, color="#16a34a", fontcolor="#166534", penwidth=2.0];
+  "root/enrich-results" [label="enrich-results\n(subflow)\n[Success]\n26.643542ms", shape=folder, fillcolor="lightgreen", style=filled, color="#16a34a", fontcolor="#166534", penwidth=2.0];
+  "root/fetch-profile" [label="fetch-profile\n(critical)\n[Success]\n22.335917ms", shape=ellipse, fillcolor="lightcoral", style=filled, color="#16a34a", fontcolor="#166534", penwidth=2.0];
+  "root/premium-ranking" [label="premium-ranking\n(critical)\n[Success]\n31.143667ms", shape=ellipse, fillcolor="lightcoral", style=filled, color="#16a34a", fontcolor="#166534", penwidth=2.0];
+  "root/select-pipeline" [label="select-pipeline\n(route)\n[Success]\nroute=0\n1.958µs", shape=box, fillcolor="lightblue", style=filled, color="#16a34a", fontcolor="#166534", penwidth=2.0];
+  "root/standard-ranking" [label="standard-ranking\n(critical)\n[Skipped]\nroute not selected", shape=ellipse, fillcolor="lightcoral", style=filled, color="#94a3b8", fontcolor="#64748b", penwidth=1.5];
+  "root/check-eligibility" -> "root/select-pipeline";
+  "root/fetch-profile" -> "root/check-eligibility";
+  "root/premium-ranking" -> "root/enrich-results";
+  "root/select-pipeline" -> "root/premium-ranking" [style=bold, color="#2563eb", penwidth=2.5, label="0"];
+  "root/select-pipeline" -> "root/standard-ranking" [style=dashed, color="#cbd5e1", fontcolor="#94a3b8", label="1"];
+  "root/standard-ranking" -> "root/enrich-results";
+
+  subgraph "cluster_root/enrich-results" {
+    label="Subflow: enrichment-subflow";
+    color="#60a5fa";
+    style="rounded,dashed";
+    penwidth=1.5;
+    "root/enrich-results/load-features" [label="load-features\n(critical)\n[Success]\n15.4465ms", shape=ellipse, fillcolor="lightcoral", style=filled, color="#16a34a", fontcolor="#166534", penwidth=2.0];
+    "root/enrich-results/merge-features" [label="merge-features\n(critical)\n[Success]\n10.955833ms", shape=ellipse, fillcolor="lightcoral", style=filled, color="#16a34a", fontcolor="#166534", penwidth=2.0];
+    "root/enrich-results/load-features" -> "root/enrich-results/merge-features";
+  }
+  "root/enrich-results" -> "root/enrich-results/load-features" [style=dotted, color="#16a34a", label="subflow", lhead="cluster_root/enrich-results"];
+}

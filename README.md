@@ -1,6 +1,10 @@
-# DagBee
+<p align="center">
+  <img src="asset/dagbee-logo.png" alt="DagBee logo" width="220">
+</p>
 
-A lightweight, production-ready DAG (Directed Acyclic Graph) execution framework for Go. Designed to be embedded in latency-sensitive microservices such as recommendation engines — no external scheduler, no infrastructure dependencies.
+<p align="center">
+ DagBee: Lightweight In-Memory DAG Orchestration for Go | Nested Subflow · Priority Schedule · Deadlock Safe · No External Dependencies
+</p>
 
 ## Features
 
@@ -18,7 +22,11 @@ A lightweight, production-ready DAG (Directed Acyclic Graph) execution framework
 - **YAML configuration** — declare topology and node settings in YAML; register functions in Go
 - **Conditional execution** — skip nodes based on runtime predicates
 - **Route branching** — multi-branch routing via RouteFn + RouteMap; one index can activate multiple downstream nodes simultaneously
-- **Subflow** — dynamically generate and execute child DAGs at runtime with shared DAGContext, shared worker pool, and async dispatch (no worker blocking)- **Visualization** — text-based topological layer output for debugging
+- **Subflow** — dynamically generate and execute child DAGs at runtime with shared DAGContext, shared worker pool, and async dispatch (no worker blocking)
+- **Visualization** — text-based topological layer output for debugging
+- **DOT export** — static topology plus execution-aware Graphviz output with status, condition results, selected routes, and expanded Subflows
+- **Chrome Trace** — Perfetto-compatible JSON timeline with full event tracing (start/end/retry/skip/fail), route args, subflow nesting
+- **Flame graph** — standard folded-stack `parent;child duration_us` output for slow-node identification
 - **Object pooling** — `sync.Pool` reuse of DagResult / NodeResult to reduce GC pressure
 - **Near-zero framework overhead** — ~7μs to build a 20-node DAG, ~1.3μs scheduling per node, ~360B memory per node
 
@@ -171,6 +179,65 @@ d, err := dagbee.LoadDAGFromYAML("examples/recommend/pipeline.yaml", registry)
 | `EngineWithLogger(l)` | Inject a custom Logger into the engine |
 | `EngineWithDAGContextShards(n)` | DAGContext shard count (default: NumCPU*4) |
 | `EngineWithMaxSubflowDepth(n)` | Max subflow nesting depth (default: 10) |
+## Observability Exports
+
+Run the complete example to export all three formats:
+
+```bash
+go run ./examples/observability
+```
+
+Generated files:
+
+- `examples/observability/dag.dot` — execution-aware topology; render with `dot -Tsvg examples/observability/dag.dot -o examples/observability/dag.svg`
+- `examples/observability/trace.json` — open in [Perfetto](https://ui.perfetto.dev/) or `chrome://tracing`
+- `examples/observability/flamegraph.folded` — folded stack data for generating a flame graph
+
+The example covers critical, conditional, route, skipped-branch, and nested Subflow nodes. The generated DOT expands the runtime-created child DAG and highlights the selected execution path.
+
+Render and view the flame graph:
+
+```bash
+# Install the FlameGraph renderer once.
+git clone --depth 1 https://github.com/brendangregg/FlameGraph.git /tmp/FlameGraph
+
+# Convert folded stack data to SVG.
+/tmp/FlameGraph/flamegraph.pl \
+  --title "DagBee Execution Flame Graph" \
+  --countname "microseconds" \
+  examples/observability/flamegraph.folded \
+  > examples/observability/flamegraph.svg
+
+# Open the generated SVG on macOS.
+open examples/observability/flamegraph.svg
+
+# Linux alternative:
+# xdg-open examples/observability/flamegraph.svg
+```
+
+The wider the frame, the more total execution time it represents. Nested frames show Subflow call paths; hover a frame to inspect its exact duration and click it to zoom.
+
+```go
+// 1. Static DOT topology, available before execution.
+staticDOT := d.ExportDOT()
+
+result := eng.Run(ctx, d)
+defer dagbee.ReleaseDagResult(result)
+
+// 2. Execution-aware DOT topology. Export before releasing result.
+// Includes status, condition result, selected route, and Subflow children.
+executionDOT := result.ExportDOT()
+
+// 3. Chrome Trace timeline (post-execution, timing analysis)
+trace, _ := result.ExportChromeTrace()
+os.WriteFile("trace.json", []byte(trace), 0644)
+// Open chrome://tracing or perfetto.dev
+
+// 4. Flame graph (post-execution, slow-node identification)
+fg := result.ExportFlamegraph()
+// flamegraph.pl flame.folded > flame.svg
+```
+
 ## Architecture
 
 ```
@@ -233,6 +300,9 @@ dagbee/
 ├── errors.go           Sentinel errors + PanicError
 ├── logger.go           Logger interface + StdLogger
 ├── visualize.go        Text-based DAG topology visualization
+├── dot.go              DOT/Graphviz topology export
+├── execution_dot.go    Execution-aware DOT with runtime Subflow expansion
+├── trace.go            Chrome Trace JSON + flame graph text export
 ├── doc.go              Package documentation & file organization guide
 │
 │── Tests ────────────────────────────────────────────
@@ -240,12 +310,14 @@ dagbee/
 ├── engine_test.go      Engine scheduling, concurrency, fault tolerance tests
 ├── dagcontext_test.go       DAGContext concurrency safety tests
 ├── benchmark_test.go   Performance benchmarks
+├── observability_test.go DOT/Trace/Flamegraph export tests
 │
 │── Examples & Docs ──────────────────────────────────
 ├── examples/
 │   ├── simple/         Minimal 3-node example
 │   ├── mapreduce/      Word-count MapReduce pipeline (split→map→shuffle→reduce→merge)
 │   ├── subflow/        Dynamic subflow: runtime child DAG with shared context & worker pool
+│   ├── observability/  Export DOT, Chrome Trace, and flame graph files
 │   └── recommend/      Recommendation pipeline with YAML config
 │       ├── main.go     Multi-channel recall → merge → fill_detail → filter
 │       │               → CTR/CVR scoring → eCPM fusion → rerank

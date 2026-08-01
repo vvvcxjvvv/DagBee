@@ -603,6 +603,57 @@ Event loop 从 4 路 select 降为 3 路：
 **测试**：11 个测试覆盖基本 if/else、全分支验证、merge pending 归零、多分支激活、ConditionFn 互斥、嵌套下游、路由节点失败、subflow 内路由。67 个测试全部通过，`-race -count=3` 零失败。
 
 
+## #6 可观测体系补齐
+
+### 当前问题
+
+仅支持 `Visualize()` 纯文本拓扑输出，无可视化格式、无性能追踪、无慢节点定位。Hook 接口虽有 BeforeNode/AfterNode 埋点但无内置导出，用户需手写序列化逻辑。同类框架（C++ Taskflow DTF、go-taskflow DOT+Trace）均内置标准格式导出。
+
+### 策略抉择
+
+选择三种纯文本格式导出，零外部依赖，服务不同排查场景：
+
+| 格式 | 解决的问题 | 数据源 | 查看工具 |
+|------|----------|--------|---------|
+| DOT | 静态结构与实际执行路径是什么 | DAG 结构 + DagResult 状态 + SubflowResult 嵌套 | graphviz `dot -Tsvg` |
+| Chrome Trace | 时间花在哪里 | DagResult 时间戳 + NodeResult 状态 | chrome://tracing, Perfetto |
+| 火焰图 | 哪个节点最慢 | DagResult Duration + SubflowResult 嵌套 | flamegraph.pl |
+
+### 落地实现
+
+**文件**: `dot.go`（新增）、`execution_dot.go`（新增）、`trace.go`（新增）、`result.go`、`engine.go`、`observability_test.go`（新增）
+
+**DOT 导出** (`DAG.ExportDOT()`)：
+- 节点类型用 shape+color 区分：normal(ellipse/white)、critical(ellipse/lightcoral)、condition(diamond/lightyellow)、route(box/lightblue)、subflow(folder/lightgreen)
+- 路由边用 `style=dashed` 区分普通依赖边，并标注 RouteMap 索引
+- 支持执行前导出（静态拓扑）
+
+**动态执行 DOT 导出** (`DagResult.ExportDOT()`)：
+- `DagResult` 在释放前保留对应 DAG 的只读引用，子 `SubflowResult` 同样保留运行时构建的子 DAG
+- 节点标签展示 Status、Duration、Condition true/false、RouteIndex 和 SkipReason
+- 节点类型继续使用 shape/fillcolor，执行状态使用边框颜色区分，避免类型与状态颜色互相覆盖
+- Route 选中边使用蓝色粗实线，未选中边使用灰色虚线，并保留分支索引
+- 动态 Subflow 使用 Graphviz cluster 递归展开，完整显示子节点、子图依赖和多层嵌套
+- 必须在 `ReleaseDagResult` 前导出；释放时递归清理 DAG 引用和嵌套结果
+- 修复标签换行双重转义，输出 Graphviz 可识别的 `\n`，不再显示字面量 `\n`
+
+**Chrome Trace 导出** (`DagResult.ExportChromeTrace()`)：
+- 标准 Chrome Trace JSON 格式（traceEvents 数组）
+- 每个节点一个 complete event（phase X），含 ts/dur/tid/pid
+- Skipped 节点用 instant event（phase i）
+- Skipped args 包含 skip_reason；条件节点包含 condition_matched
+- 路由节点的 args 包含 route_index
+- 重试节点的 args 包含 retries
+- Subflow 结果递归展开，depth 编码到 tid
+
+**火焰图导出** (`DagResult.ExportFlamegraph()`)：
+- 标准 folded stack `parent;child duration_us` 文本格式，栈路径与计数之间使用空格分隔
+- 按耗时降序排列（慢节点在前）
+- Subflow 嵌套展开，路径含 DAG 名：`outer;sub;inner;child 5000`
+
+**测试**：覆盖基本 DAG、Graphviz 换行、各节点类型、运行时状态、条件结果、Route 选中/未选中边、动态 Subflow cluster、Skipped 事件、路由 args、Subflow 嵌套、排序、空 DAG、重试计数和三种格式联合验证。
+
+
 <!--
 模板（复制后填充）:
 

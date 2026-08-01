@@ -12,7 +12,7 @@
 //	  node.go         Node type, NodeFunc signature, NodeStatus, NodeOption helpers
 //
 //	Engine ─ Execution and scheduling
-//	  engine.go       Execution engine: executeDAG, event loop with work-stealing, subflow support, retry/fallback
+//	  engine.go       Execution engine: async subflow event loop, route branching, retry/fallback
 //	  scheduler.go    Priority-based ready-queue (container/heap), SchedulerStrategy interface
 //	  workerpool.go   Shared worker pool (unbuffered readyCh, per-DAG doneCh via execTask)
 //
@@ -27,4 +27,7 @@
 //	  errors.go       Sentinel errors and PanicError
 //	  logger.go       Logger interface, StdLogger, noopLogger
 //	  visualize.go    Text-based DAG topology visualization
+//	  dot.go          Static DOT/Graphviz topology export
+//	  execution_dot.go Execution-aware DOT with runtime Subflow expansion
+//	  trace.go        Chrome Trace and folded-stack flame graph export
 package dagbee
