@@ -172,6 +172,142 @@ eng := NewEngine(EngineWithDAGContextShards(256)) // 高并发场景
 
 ---
 
+## #2 单 goroutine 事件循环性能瓶颈
+
+### 当前问题
+
+`Engine.Run` 的所有调度逻辑——`doneCh` 接收、依赖计数递减、`scheduler.Enqueue`/`Dequeue`、`launchReady` 批量启动——都在单个主 goroutine 中串行执行。节点执行本身是并行的（每个节点一个 `go func()`），但调度决策是单线程的。
+
+具体瓶颈点：
+
+1. **`launchReady` 串行批量启动** — 1024 个节点同时就绪时，`launchReady` 在一个 `for` 循环里串行做 1024 次 `Dequeue` + `go func()`，期间主循环无法消费 `doneCh`。
+2. **`scheduler` 冗余锁** — `priorityScheduler` 有 `sync.Mutex`，但 `Enqueue`/`Dequeue`/`Len` 只在主 goroutine 调用，无并发访问。1024 节点 = 4096 次无意义锁操作。
+3. **per-node goroutine 创建开销** — 每个节点 `go func()` 创建一个新 goroutine，初始栈 2KB，1024 节点 = 2MB 栈分配 + GC 压力。benchmark 显示 1024 节点 3245 allocs。
+4. **`doneCh` buffer = total 的内存浪费** — 1000 节点预分配 1000 容量的 channel buffer。
+
+非问题项：`doneCh` buffer=total 保证写端不阻塞，不会反压；依赖传播 O(下游数) 通常很小；`started` map 仅主 goroutine 访问无竞争。
+
+### 策略抉择
+
+#### 方案 A：移除 scheduler 冗余锁
+
+将 `priorityScheduler` 的 `sync.Mutex` 移除，所有方法变为非线程安全。
+
+| 优点 | 缺点 |
+|------|------|
+| 零风险，纯收益 | 无 |
+| 代码更诚实，消除误导性并发暗示 | |
+| 消除 4096 次无意义锁操作 | |
+
+#### 方案 B：worker pool 替代 per-node goroutine
+
+预启动 N 个 worker goroutine（N = maxConcurrency），通过 `readyCh` 投递任务，worker 执行完通过 `doneCh` 回报结果。
+
+| 优点 | 缺点 |
+|------|------|
+| goroutine 创建/销毁开销归零，栈复用 | worker 生命周期管理、stop 时机需谨慎处理 |
+| allocs 大幅下降（1024 节点从 3245 降至 1216） | `readyCh` 需带 buffer（= worker 数），否则 worker 未就绪时 launchReady 误判为"无空闲 worker" |
+| 并发度天然由 worker 数控制，无需额外 semaphore | |
+
+#### 方案 C：批量 dequeue + 批量 go func
+
+`launchReady` 一次性从 heap 取出所有就绪节点到 slice，然后批量 `go func()`。
+
+| 优点 | 缺点 |
+|------|------|
+| 减少 `Dequeue` 的锁操作次数 | 和当前实现差别不大，瓶颈不在 Dequeue 而在 `go func()` 本身 |
+| | 不消除 goroutine 创建开销 |
+
+#### 方案 D：channel 驱动的独立 dispatcher goroutine
+
+主循环只负责 `doneCh` → 依赖传播 → `readyCh <- node`，独立 dispatcher goroutine 消费 `readyCh` 并启动 worker。
+
+| 优点 | 缺点 |
+|------|------|
+| 主循环不再阻塞在 `launchReady` | 引入额外 goroutine，`started` 等共享状态需要同步 |
+| 调度延迟降低 | 架构复杂度增加 |
+
+#### 抉择
+
+选择 **方案 A + 方案 B**。
+
+方案 A 零风险，立即收益。方案 B 是结构性优化，消除 per-node goroutine 创建开销。方案 C 和 D 是中间态，收益有限但增加复杂度。
+
+关键实现难点：`readyCh` 必须带 buffer（容量 = worker 数），否则 `launchReady` 的非阻塞 `select` 在 worker 尚未被调度到 `range readyCh` 时误走 `default` 分支，导致节点不被分发、主循环死锁。
+
+### 落地实现
+
+**文件**: `scheduler.go`、`workerpool.go`（新增）、`engine.go`
+
+**方案 A — 移除 scheduler 锁** (`scheduler.go`)：
+
+```go
+// 所有方法移除 sync.Mutex，变为非线程安全
+type priorityScheduler struct {
+    heap nodeHeap  // 无 mu 字段
+}
+```
+
+**方案 B — worker pool** (`workerpool.go` 新增)：
+
+```go
+type workerPool struct {
+    readyCh chan *Node        // buffer = workers
+    doneCh  chan<- *NodeResult
+    exec    func(*Node) *NodeResult
+    wg      sync.WaitGroup
+    workers int
+    once    sync.Once
+}
+```
+
+- `start()` 预启动 N 个 worker goroutine，每个 `for node := range wp.readyCh`
+- `stop()` 关闭 `readyCh`，worker 完成当前节点后退出
+- `wait()` 等待所有 worker 退出
+
+**引擎调度改造** (`engine.go`)：
+
+```go
+// 替代 per-node go func()
+wp := newWorkerPool(maxConc, execFn, doneCh)
+wp.start()
+
+launchReady := func() {
+    for scheduler.Len() > 0 {
+        select {
+        case wp.readyCh <- scheduler.Peek():  // 非阻塞投递
+            node := scheduler.Dequeue()
+            started[node.Name] = true
+        default:
+            return  // 所有 worker 忙
+        }
+    }
+}
+
+// 主循环结束后
+wp.stop()  // 关闭 readyCh
+wp.wait()  // 等待 worker 退出
+```
+
+关键改动：
+- 移除 `sem` channel，并发度由 worker 数天然控制
+- 移除 `sync.WaitGroup`（原 `wg`），改用 `wp.wait()`
+- `maxConc` clamp 到 `total` 避免空闲 worker
+
+**基准测试对比**（Apple M1 Pro, 10 core, 3 次取中位数）:
+
+| Benchmark | 优化前 ns/op | 优化后 ns/op | 提升 | 优化前 allocs | 优化后 allocs | allocs 降幅 |
+|-----------|-------------|-------------|------|-------------|-------------|------------|
+| WideDAG 1024 | 1,256,000 | 1,123,000 | 11% | 3,245 | 1,216 | 63% |
+| FanOutFanIn 512 | 806,000 | 747,000 | 7% | 2,986 | 1,978 | 34% |
+| ParallelReq p=4 | 57,375 | 54,300 | 5% | 413 | 354 | 14% |
+| ParallelReq p=16 | 38,893 | 36,400 | 6% | 412 | 353 | 14% |
+
+WideDAG 1024 节点的 allocs 降幅最大（63%），因为消除了 1024 次 goroutine 创建。延迟提升 5-11%，noop 节点场景下调度开销占主导，真实有工作量的节点场景下提升比例更高。
+
+
+---
+
 <!--
 模板（复制后填充）:
 

@@ -5,7 +5,7 @@ A lightweight, production-ready DAG (Directed Acyclic Graph) execution framework
 ## Features
 
 - **Parallel + serial mixed execution** — nodes with no dependency run concurrently; dependent nodes run in order
-- **Concurrency control** — configurable max parallelism via semaphore
+- **Concurrency control** — configurable max parallelism via worker pool
 - **Priority scheduling** — ready nodes are dispatched by priority (higher = first)
 - **Per-node timeout & retry** — independent timeout, retry count, and backoff strategy (fixed / exponential) per node
 - **Failure strategies** — critical nodes abort the DAG; non-critical nodes degrade gracefully
@@ -157,7 +157,7 @@ d, err := dagbee.LoadDAGFromYAML("examples/recommend/pipeline.yaml", registry)
 
 | Option | Description |
 |--------|-------------|
-| `WithMaxConcurrency(n)` | Max parallel goroutines (default: NumCPU) |
+| `WithMaxConcurrency(n)` | Max parallel workers (default: NumCPU) |
 | `WithTimeout(d)` | Overall DAG execution timeout |
 | `WithHook(h)` | Register a lifecycle hook |
 | `WithLogger(l)` | Inject a custom Logger |
@@ -169,7 +169,7 @@ User Layer       Core Layer            Engine Layer            Data Layer
 ┌──────────┐    ┌──────────────┐      ┌───────────────┐      ┌─────────────┐
 │ Go API   │───►│ DAG          │─────►│ Engine        │─────►│ DAGContext │
 │ YAML Cfg │    │ Node         │      │ Scheduler     │      │ DagResult   │
-└──────────┘    │ Validator    │      │ Executor      │      │ Hooks       │
+└──────────┘    │ Validator    │      │ WorkerPool    │      │ Hooks       │
                 └──────────────┘      └───────────────┘      │ Logger      │
                                                              └─────────────┘
 ```
@@ -211,6 +211,7 @@ dagbee/
 │── Engine ───────────────────────────────────────────
 ├── engine.go           Execution engine: scheduling, retry, fallback
 ├── scheduler.go        Priority-based ready-queue (container/heap)
+├── workerpool.go       Fixed-size worker pool (replaces per-node goroutine)
 │
 │── Data ─────────────────────────────────────────────
 ├── dagcontext.go            DAGContext: sharded key-value store with per-shard RWMutex

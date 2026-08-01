@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -75,10 +74,11 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 	if maxConc <= 0 {
 		maxConc = runtime.NumCPU()
 	}
-	sem := make(chan struct{}, maxConc)
-	doneCh := make(chan *NodeResult, total)
+	if maxConc > total {
+		maxConc = total
+	}
 
-	var wg sync.WaitGroup
+	doneCh := make(chan *NodeResult, total)
 	started := make(map[string]bool, total)
 	scheduler := newPriorityScheduler()
 	var dagFailed int32
@@ -90,28 +90,26 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 		}
 	}
 
-	// launchReady starts as many ready nodes as the semaphore allows.
-	// Called from the main event loop goroutine only — no concurrent access to `started`.
+	// --- Worker pool ---
+	// A fixed set of worker goroutines replaces per-node go func() calls.
+	// Workers block on wp.readyCh; the main loop dispatches nodes as workers
+	// become idle, so concurrency is naturally bounded by worker count.
+	wp := newWorkerPool(maxConc, func(node *Node) *NodeResult {
+		return e.executeNode(dagCtx, node, dctx, d, logger)
+	}, doneCh)
+	wp.start()
+
+	// launchReady dispatches as many ready nodes as there are idle workers.
+	// Called from the main event loop goroutine only — no concurrent access
+	// to `started` or `scheduler`.
 	launchReady := func() {
 		for scheduler.Len() > 0 {
-			// Try to acquire a semaphore slot without blocking.
 			select {
-			case sem <- struct{}{}:
+			case wp.readyCh <- scheduler.Peek():
 				node := scheduler.Dequeue()
-				if node == nil {
-					<-sem
-					return
-				}
 				started[node.Name] = true
-				wg.Add(1)
-				go func(n *Node) {
-					defer wg.Done()
-					nr := e.executeNode(dagCtx, n, dctx, d, logger)
-					<-sem // release semaphore BEFORE sending result
-					doneCh <- nr
-				}(node)
 			default:
-				return // semaphore full — will retry after next completion
+				return // all workers busy — will retry after next completion
 			}
 		}
 	}
@@ -181,7 +179,8 @@ func (e *Engine) Run(ctx context.Context, d *DAG) *DagResult {
 		}
 	}
 
-	wg.Wait()
+	wp.stop()
+	wp.wait()
 
 	// --- Finalize result ---
 	result.EndTime = time.Now()

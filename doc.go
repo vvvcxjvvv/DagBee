@@ -14,6 +14,7 @@
 //	Engine ─ Execution and scheduling
 //	  engine.go       Execution engine: validation, scheduling loop, retry/fallback, result collection
 //	  scheduler.go    Priority-based ready-queue (container/heap), SchedulerStrategy interface
+//	  workerpool.go   Fixed-size worker pool replacing per-node goroutine creation
 //
 //	Data ─ Runtime data and results
 //	  dagcontext.go    DAGContext: sharded concurrency-safe key-value store for inter-node data passing

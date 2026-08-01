@@ -1,9 +1,6 @@
 package dagbee
 
-import (
-	"container/heap"
-	"sync"
-)
+import "container/heap"
 
 // SchedulerStrategy defines the interface for node scheduling policies.
 type SchedulerStrategy interface {
@@ -15,8 +12,11 @@ type SchedulerStrategy interface {
 
 // priorityScheduler implements SchedulerStrategy using a max-heap
 // ordered by Node.Priority (higher value = dequeued first).
+//
+// All methods are NOT safe for concurrent use. The scheduler is used
+// exclusively from the engine's main event-loop goroutine, so no locking
+// is required.
 type priorityScheduler struct {
-	mu   sync.Mutex
 	heap nodeHeap
 }
 
@@ -27,16 +27,12 @@ func newPriorityScheduler() *priorityScheduler {
 }
 
 func (s *priorityScheduler) Enqueue(nodes ...*Node) {
-	s.mu.Lock()
 	for _, n := range nodes {
 		heap.Push(&s.heap, n)
 	}
-	s.mu.Unlock()
 }
 
 func (s *priorityScheduler) Dequeue() *Node {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.heap.Len() == 0 {
 		return nil
 	}
@@ -44,8 +40,6 @@ func (s *priorityScheduler) Dequeue() *Node {
 }
 
 func (s *priorityScheduler) Peek() *Node {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.heap.Len() == 0 {
 		return nil
 	}
@@ -53,8 +47,6 @@ func (s *priorityScheduler) Peek() *Node {
 }
 
 func (s *priorityScheduler) Len() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.heap.Len()
 }
 
