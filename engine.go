@@ -226,13 +226,60 @@ func (e *Engine) executeDAG(
 
 			// Propagate completion to downstream nodes.
 			if atomic.LoadInt32(&dagFailed) == 0 {
-				for _, downstream := range d.edges[nr.NodeName] {
-					if started[downstream] {
-						continue
+				if routeMap := d.routeEdges[nr.NodeName]; routeMap != nil && nr.RouteIndex >= 0 {
+					// Route node: edges (from DependsOn) holds ALL structural
+					// downstreams and is required for pending counts and topo
+					// sort. routeEdges (from RouteMap) is a filter overlay — it
+					// selects which entries in edges to activate vs skip.
+					// Both are populated for the same node; we iterate edges
+					// and use routeMap to partition into selected/skipped.
+					// Activate only the selected branch, mark all other
+					// downstreams as Skipped.
+					selected := make(map[string]bool)
+					for _, name := range routeMap[nr.RouteIndex] {
+						selected[name] = true
 					}
-					newCount := atomic.AddInt32(pending[downstream], -1)
-					if newCount == 0 {
-						scheduler.Enqueue(d.nodes[downstream])
+					for _, downstream := range d.edges[nr.NodeName] {
+						if started[downstream] {
+							continue
+						}
+						if selected[downstream] {
+							newCount := atomic.AddInt32(pending[downstream], -1)
+							if newCount == 0 {
+								scheduler.Enqueue(d.nodes[downstream])
+							}
+						} else {
+							// Unselected branch: mark Skipped so its
+							// downstream pending still decrements.
+							started[downstream] = true
+							completed++
+							skipNR := acquireNodeResult()
+							skipNR.NodeName = downstream
+							skipNR.Status = StatusSkipped
+							result.Results[downstream] = skipNR
+							d.hooks.OnNodeSkip(dagCtx, downstream, "route not selected")
+							// Propagate skip to the skipped node's downstream.
+							for _, dd := range d.edges[downstream] {
+								if started[dd] {
+									continue
+								}
+								newCount := atomic.AddInt32(pending[dd], -1)
+								if newCount == 0 {
+									scheduler.Enqueue(d.nodes[dd])
+								}
+							}
+						}
+					}
+				} else {
+					// Normal node: activate all downstreams.
+					for _, downstream := range d.edges[nr.NodeName] {
+						if started[downstream] {
+							continue
+						}
+						newCount := atomic.AddInt32(pending[downstream], -1)
+						if newCount == 0 {
+							scheduler.Enqueue(d.nodes[downstream])
+						}
 					}
 				}
 			}
@@ -432,6 +479,10 @@ func (e *Engine) executeNode(
 			} else {
 				nr.Status = StatusSuccess
 			}
+			// Route node: evaluate RouteFn after successful execution.
+			if n.RouteFn != nil {
+				nr.RouteIndex = n.RouteFn(dctx)
+			}
 			return
 		}
 
@@ -441,6 +492,10 @@ func (e *Engine) executeNode(
 				logger.Info("node fallback succeeded", "node", n.Name)
 				nr.Status = StatusSuccess
 				nr.Error = nil
+				// Route node: evaluate RouteFn after fallback success.
+				if n.RouteFn != nil {
+					nr.RouteIndex = n.RouteFn(dctx)
+				}
 				return
 			}
 			logger.Warn("node fallback also failed", "node", n.Name)

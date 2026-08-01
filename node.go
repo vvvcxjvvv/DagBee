@@ -94,6 +94,8 @@ type Node struct {
 	FallbackFn    NodeFunc
 	ConditionFn   func(*DAGContext) bool // when non-nil, node runs only if this returns true
 	SubflowFn     SubflowFunc            // when non-nil, node is a subflow node; Fn is ignored
+	RouteFn       func(*DAGContext) int  // when non-nil, node is a route node; RouteMap selects downstream branches
+	RouteMap      map[int][]string       // route index → downstream node names; used with RouteFn
 }
 
 // NodeOption configures a Node using the functional options pattern.
@@ -147,4 +149,20 @@ func NodeWithCondition(fn func(*DAGContext) bool) NodeOption {
 // worker pool. When set, Fn is ignored.
 func NodeWithSubflow(fn SubflowFunc) NodeOption {
 	return func(n *Node) { n.SubflowFn = fn }
+}
+
+// NodeWithRoute configures the node as a route node that selects downstream
+// branches based on a runtime index. After the node's Fn executes, RouteFn is
+// called to get an index; only the downstream nodes listed in RouteMap[index]
+// are activated — all others are marked Skipped. The downstream nodes should
+// also be declared via NodeWithDependsOn so that edges are registered.
+//
+// RouteFn and ConditionFn are mutually exclusive: a node cannot be both a
+// gate (skip self) and a router (select downstream). Setting both is rejected
+// by Validate.
+func NodeWithRoute(fn func(*DAGContext) int, routeMap map[int][]string) NodeOption {
+	return func(n *Node) {
+		n.RouteFn = fn
+		n.RouteMap = routeMap
+	}
 }

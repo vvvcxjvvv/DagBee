@@ -9,8 +9,9 @@ import (
 type DAG struct {
 	name           string
 	nodes          map[string]*Node
-	edges          map[string][]string // from -> [downstream names]
-	reverseEdges   map[string][]string // to   -> [upstream names]
+	edges          map[string][]string         // from -> [downstream names]
+	reverseEdges   map[string][]string         // to   -> [upstream names]
+	routeEdges     map[string]map[int][]string // routeNode -> {index: [downstream]}
 	maxConcurrency int
 	timeout        time.Duration
 	hooks          *HookChain
@@ -24,6 +25,7 @@ func NewDAG(name string, opts ...DAGOption) *DAG {
 		nodes:        make(map[string]*Node),
 		edges:        make(map[string][]string),
 		reverseEdges: make(map[string][]string),
+		routeEdges:   make(map[string]map[int][]string),
 		hooks:        NewHookChain(),
 		logger:       noopLogger{},
 	}
@@ -75,6 +77,11 @@ func (d *DAG) AddNode(name string, fn NodeFunc, opts ...NodeOption) error {
 		d.reverseEdges[name] = append(d.reverseEdges[name], dep)
 	}
 
+	// Register route edges if the node has a RouteMap.
+	if node.RouteMap != nil {
+		d.routeEdges[name] = node.RouteMap
+	}
+
 	return nil
 }
 
@@ -90,6 +97,20 @@ func (d *DAG) Validate() error {
 		for _, dep := range node.DependsOn {
 			if _, ok := d.nodes[dep]; !ok {
 				return fmt.Errorf("%w: node %q depends on %q", ErrDependencyMissing, name, dep)
+			}
+		}
+		// RouteFn and ConditionFn are mutually exclusive.
+		if node.RouteFn != nil && node.ConditionFn != nil {
+			return fmt.Errorf("dagbee: node %q cannot have both RouteFn and ConditionFn", name)
+		}
+		// Validate RouteMap references.
+		if node.RouteFn != nil && node.RouteMap != nil {
+			for _, downstreams := range node.RouteMap {
+				for _, dn := range downstreams {
+					if _, ok := d.nodes[dn]; !ok {
+						return fmt.Errorf("dagbee: route node %q references unknown downstream %q", name, dn)
+					}
+				}
 			}
 		}
 	}

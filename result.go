@@ -15,6 +15,7 @@ type NodeResult struct {
 	Error         error
 	RetryCount    int        // number of retries actually performed (0 = first attempt succeeded)
 	SubflowResult *DagResult // subflow node's child DAG result; nil for normal nodes
+	RouteIndex    int        // route node's selected branch index; -1 for non-route nodes
 }
 
 // Reset clears all fields, preparing the result for pool reuse.
@@ -26,6 +27,7 @@ func (r *NodeResult) Reset() {
 	r.Duration = 0
 	r.Error = nil
 	r.RetryCount = 0
+	r.RouteIndex = -1
 	if r.SubflowResult != nil {
 		releaseDagResultRecursive(r.SubflowResult)
 		r.SubflowResult = nil
@@ -117,7 +119,7 @@ func releaseDagResultRecursive(r *DagResult) {
 // ---------- sync.Pool for object reuse ----------
 
 var nodeResultPool = sync.Pool{
-	New: func() interface{} { return &NodeResult{} },
+	New: func() interface{} { return &NodeResult{RouteIndex: -1} },
 }
 
 var dagResultPool = sync.Pool{

@@ -578,6 +578,31 @@ Event loop 从 4 路 select 降为 3 路：
 56 个测试全部通过，`-race -count=5` 零失败。
 
 
+## #5 Route 路由分支支持
+
+### 当前问题
+
+`ConditionFn func(*DAGContext) bool` 是节点级门控，只能跳过自身。要多分支路由（if/else if/else），需在每个下游节点写 ConditionFn，路由逻辑分散、不显式、merge 的 pending 正确性依赖隐含假设。
+
+### 策略抉择
+
+对比 5 个方案：保持现状（per-node ConditionFn 路由）、RouteFn + RouteMap（条件边组）、SwitchFn + 位置数组、运行时动态边剪枝、C++ Taskflow 强弱依赖模型。
+
+选择 **RouteFn + RouteMap**。路由逻辑集中在一个函数，RouteMap 用显式 map 支持稀疏索引和多分支激活，复用现有 Skipped 回流机制，不破坏 pending 模型。详见 `docs/route-condition-design.md`。
+
+### 落地实现
+
+**文件**: `node.go`、`result.go`、`dag.go`、`engine.go`、`route_test.go`
+
+- **Node** 新增 `RouteFn func(*DAGContext) int` 和 `RouteMap map[int][]string`
+- **NodeResult** 新增 `RouteIndex int`（-1 表示非路由节点）
+- **DAG** 新增 `routeEdges map[string]map[int][]string`，`AddNode` 解析 RouteMap，`Validate` 校验引用和 ConditionFn 互斥
+- **executeNode** 成功执行后调用 RouteFn 设置 RouteIndex
+- **Event loop** 依赖传播：路由节点只激活选中分支，未选中分支标记 Skipped 并递归传播 pending
+
+**测试**：11 个测试覆盖基本 if/else、全分支验证、merge pending 归零、多分支激活、ConditionFn 互斥、嵌套下游、路由节点失败、subflow 内路由。67 个测试全部通过，`-race -count=3` 零失败。
+
+
 <!--
 模板（复制后填充）:
 
