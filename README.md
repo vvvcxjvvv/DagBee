@@ -356,6 +356,25 @@ go test -run '^$' \
   -benchmem ./...
 ```
 
+### go-taskflow Comparison
+
+The isolated comparison module runs matched wide, deep, fan-out/fan-in, and
+Subflow topologies through DagBee and `noneback/go-taskflow` v1.2.0:
+
+```bash
+cd benchmarks/comparison
+go test -run '^$' -bench '^BenchmarkComparison$' -benchmem -count 5
+```
+
+Both sides are compiled into one benchmark binary and use prebuilt graphs,
+empty node functions, the same concurrency, and their public end-to-end
+execution APIs. The comparison module requires Go 1.21.6; the DagBee module
+remains compatible with Go 1.19. See the
+[benchmark methodology](benchmarks/comparison/README.md) before interpreting
+the results. Current correctness risks, profile findings, and the staged
+optimization roadmap are documented in
+[risk and performance optimization](docs/risk-and-performance-optimization.md).
+
 ## License
 
 MIT
